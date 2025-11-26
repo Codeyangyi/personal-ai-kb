@@ -1,0 +1,55 @@
+version: '3.8'  # Compose 文件版本（兼容当前 Docker 版本即可）
+
+services:
+  # 1. Vue3 前端服务
+  frontend:
+    build: ./frontend  # 构建前端镜像（指向 frontend 目录的 Dockerfile）
+    ports:
+      - "8006:8006"  # 宿主机 80 端口 → 前端容器 80 端口（访问 http://localhost 即可打开 Vue3 页面）
+    depends_on:
+      - backend  # 启动顺序：先启动 backend 再启动 frontend（避免前端先启动找不到后端）
+    networks:
+      - app-network  # 加入自定义网络，与后端互通
+    restart: always  # 容器异常退出时自动重启（生产环境推荐）
+    environment:
+      - VUE_APP_API_BASE_URL=http://backend:8005  # 前端打包所需环境变量
+
+  # 2. Golang 后端服务
+  backend:
+    build: ./backend
+    ports:
+      - "8005:8005"  # 暴露后端端口，方便测试接口
+    environment:
+      - PORT=8005
+      - QDRANT_URL=http://qdrant:6333  # Qdrant 服务地址（容器间通信使用服务名）
+      - QDRANT_COLLECTION=personal_kb  # 向量集合名
+      # 可选：如果需要 API Key 认证，取消下面的注释并设置
+      # - QDRANT_API_KEY=your-api-key
+    depends_on:
+      - qdrant  # 先启动 Qdrant 再启动后端
+    networks:
+      - app-network
+    restart: always
+
+  # 3. Qdrant 向量数据库服务（官方镜像）
+  qdrant:
+    image: qdrant/qdrant:v1.10.0  # 稳定版镜像（推荐 v1.8+）
+    ports:
+      - "6333:6333"  # HTTP 端口（可选，用于 API 调试）
+      - "6334:6334"  # gRPC 端口（后端 SDK 连接用）
+      - "6335:6335"  # 集群端口（单机部署可忽略）
+    volumes:
+      - qdrant-data:/qdrant/storage  # 向量数据持久化（容器删除数据不丢）
+    environment:
+      - QDRANT_LOG_LEVEL=info  # 日志级别（info/debug）
+    networks:
+      - app-network
+    restart: always
+
+# 自定义网络：所有服务加入同一网络，可通过服务名（如 backend、mysql）互相访问
+networks:
+  app-network:
+    driver: bridge  # 桥接模式（默认，适合单机部署）
+# 数据卷：持久化 Qdrant 数据
+volumes:
+  qdrant-data:    
