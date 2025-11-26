@@ -45,10 +45,10 @@ func (r *RAG) Query(ctx context.Context, question string) (string, error) {
 	// - 在Qdrant向量数据库中进行相似性搜索
 	// - 返回最相关的topK个文本块
 
-	// 混合搜索策略：先搜索更多结果（topK*2），然后优先选择包含关键词的片段
-	searchTopK := r.topK * 2
-	if searchTopK < 10 {
-		searchTopK = 10 // 至少搜索10个结果
+	// 混合搜索策略：先搜索更多结果（topK*3），然后进行严格的相关性过滤
+	searchTopK := r.topK * 3
+	if searchTopK < 15 {
+		searchTopK = 15 // 至少搜索15个结果
 	}
 	if searchTopK > 50 {
 		searchTopK = 50 // 最多搜索50个结果
@@ -63,8 +63,11 @@ func (r *RAG) Query(ctx context.Context, question string) (string, error) {
 	}
 	fmt.Printf(" ✅ (耗时: %v, 检索到 %d 个候选片段)\n", embedDuration.Round(time.Millisecond), len(allResults))
 
-	// 对结果进行重排序：优先选择包含查询关键词的片段
+	// 对结果进行严格的重排序和相关性过滤：优先选择真正相关的片段
 	results := r.reRankResults(question, allResults, r.topK)
+
+	// 二次验证：确保结果与问题真正相关
+	results = r.filterRelevantResults(question, results)
 
 	// 调试：显示重排序后的结果
 	fmt.Printf("[调试] 重排序后选择的前 %d 个片段（包含关键词的优先）\n", len(results))
@@ -161,10 +164,10 @@ func (r *RAG) QueryWithResults(ctx context.Context, question string) (*QueryResu
 	// - 在Qdrant向量数据库中进行相似性搜索
 	// - 返回最相关的topK个文本块
 
-	// 混合搜索策略：先搜索更多结果（topK*2），然后优先选择包含关键词的片段
-	searchTopK := r.topK * 2
-	if searchTopK < 10 {
-		searchTopK = 10 // 至少搜索10个结果
+	// 混合搜索策略：先搜索更多结果（topK*3），然后进行严格的相关性过滤
+	searchTopK := r.topK * 3
+	if searchTopK < 15 {
+		searchTopK = 15 // 至少搜索15个结果
 	}
 	if searchTopK > 50 {
 		searchTopK = 50 // 最多搜索50个结果
@@ -179,8 +182,11 @@ func (r *RAG) QueryWithResults(ctx context.Context, question string) (*QueryResu
 	}
 	fmt.Printf(" ✅ (耗时: %v, 检索到 %d 个候选片段)\n", embedDuration.Round(time.Millisecond), len(allResults))
 
-	// 对结果进行重排序：优先选择包含查询关键词的片段
+	// 对结果进行严格的重排序和相关性过滤：优先选择真正相关的片段
 	results := r.reRankResults(question, allResults, r.topK)
+
+	// 二次验证：确保结果与问题真正相关
+	results = r.filterRelevantResults(question, results)
 
 	// 调试：显示重排序后的结果
 	fmt.Printf("[调试] 重排序后选择的前 %d 个片段（包含关键词的优先）\n", len(results))
@@ -284,11 +290,12 @@ func (r *RAG) buildPrompt(question string, results []schema.Document) string {
 
 	builder.WriteString("你是一个专业的AI助手。请基于以下上下文信息，**深入思考和分析**后回答问题。\n\n")
 	builder.WriteString("**核心要求**：\n")
-	builder.WriteString("1. **必须进行思考和总结**：不要直接复制粘贴文档片段的内容，而是要对信息进行理解、分析和组织\n")
-	builder.WriteString("2. **回答要有逻辑性**：将多个文档片段的信息整合成连贯、有条理的回答\n")
-	builder.WriteString("3. **回答要完整**：如果问题涉及多个方面，要全面回答，不要遗漏重要信息\n")
-	builder.WriteString("4. **只基于提供的上下文信息回答问题**，不要编造或推测信息\n")
-	builder.WriteString("5. 如果上下文中没有相关信息，请明确说明\"根据提供的上下文，我无法找到相关信息\"\n")
+	builder.WriteString("1. **严格相关性检查**：只使用与问题真正相关的文档片段。如果某个文档片段与问题无关，请忽略它，不要使用其中的信息\n")
+	builder.WriteString("2. **必须进行思考和总结**：不要直接复制粘贴文档片段的内容，而是要对信息进行理解、分析和组织\n")
+	builder.WriteString("3. **回答要有逻辑性**：将多个文档片段的信息整合成连贯、有条理的回答\n")
+	builder.WriteString("4. **回答要完整**：如果问题涉及多个方面，要全面回答，不要遗漏重要信息\n")
+	builder.WriteString("5. **只基于提供的上下文信息回答问题**，不要编造或推测信息\n")
+	builder.WriteString("6. **如果上下文中没有相关信息或所有文档片段都与问题无关**，请明确说明\"根据提供的上下文，我无法找到相关信息\"，不要强行使用不相关的片段\n")
 	builder.WriteString("6. **必须遵守**：在回答中，每当你引用或提到文档片段中的内容时，必须在引用内容的末尾立即添加对应的文档编号标注\n")
 	builder.WriteString("   - 引用文档片段1的内容，在引用内容末尾添加①\n")
 	builder.WriteString("   - 引用文档片段2的内容，在引用内容末尾添加②\n")
@@ -327,6 +334,7 @@ func (r *RAG) buildPrompt(question string, results []schema.Document) string {
 	builder.WriteString(question)
 	builder.WriteString("\n\n**请仔细阅读上述上下文信息，深入思考和分析后，组织成完整、有条理的回答。**\n")
 	builder.WriteString("\n**重要提示**：\n")
+	builder.WriteString("- **首先检查每个文档片段是否与问题相关**：只使用真正相关的片段，忽略不相关的片段\n")
 	builder.WriteString("- 不要直接复制粘贴文档片段，要对信息进行理解和整合\n")
 	builder.WriteString("- 回答要完整、有逻辑，读起来像是一个专业助手在回答问题\n")
 	builder.WriteString("- 每当你引用文档片段中的任何内容时，必须在引用内容的末尾添加对应的文档编号标注（①、②、③等）\n")
@@ -334,7 +342,8 @@ func (r *RAG) buildPrompt(question string, results []schema.Document) string {
 	builder.WriteString("- **重要**：直接回答问题，不要添加\"根据文档片段X\"、\"文档片段X提到\"等前缀\n")
 	builder.WriteString("- 示例格式：\"培训要求包括：提供系统管理员培训不少于3天①\"（正确）\n")
 	builder.WriteString("- 错误示例：\"根据文档片段1，培训要求包括：提供系统管理员培训不少于3天①\"（错误，不要添加前缀）\n")
-	builder.WriteString("\n现在请**深入思考和分析**上下文信息，然后组织成完整、有条理的回答，确保所有引用都包含文档编号标注：\n")
+	builder.WriteString("- **如果所有文档片段都与问题无关，请明确说明\"根据提供的上下文，我无法找到相关信息\"，不要强行使用不相关的信息**\n")
+	builder.WriteString("\n现在请**首先检查每个文档片段的相关性**，然后**深入思考和分析**真正相关的上下文信息，最后组织成完整、有条理的回答，确保所有引用都包含文档编号标注：\n")
 
 	return builder.String()
 }
@@ -467,15 +476,21 @@ func (r *RAG) reRankResults(question string, allResults []schema.Document, topK 
 		fmt.Println()
 	}
 
-	// 选择前topK个结果（排序后的前topK个）
+	// 选择前topK个结果（排序后的前topK个），但只选择分数大于0的结果
+	// 分数为0表示完全不相关，应该被过滤掉
 	result := make([]schema.Document, 0, topK)
-	for i := 0; i < topK && i < len(scoredDocs); i++ {
-		result = append(result, scoredDocs[i].doc)
+	for i := 0; i < len(scoredDocs) && len(result) < topK; i++ {
+		// 计算原始分数（加上索引）
+		originalScore := scoredDocs[i].score + scoredDocs[i].index
+		// 只选择分数大于0的结果（至少匹配了一些关键词）
+		if originalScore > 0 {
+			result = append(result, scoredDocs[i].doc)
+		}
 	}
 
 	// 调试：显示选择的结果
 	if len(result) > 0 {
-		fmt.Printf("[调试] 选择的结果（前%d个）: ", len(result))
+		fmt.Printf("[调试] 选择的结果（前%d个，已过滤不相关片段）: ", len(result))
 		for i := 0; i < len(result) && i < 3; i++ {
 			// 找到这个文档在原始结果中的索引
 			originalIndex := -1
@@ -488,9 +503,96 @@ func (r *RAG) reRankResults(question string, allResults []schema.Document, topK 
 			fmt.Printf("结果%d(原始索引:%d) ", i+1, originalIndex+1)
 		}
 		fmt.Println()
+	} else {
+		fmt.Printf("[警告] 重排序后没有找到相关片段，将使用原始结果的前%d个\n", topK)
+		// 如果过滤后没有结果，至少返回前topK个（即使相关性不高）
+		for i := 0; i < topK && i < len(allResults); i++ {
+			result = append(result, allResults[i])
+		}
 	}
 
 	return result
+}
+
+// filterRelevantResults 二次验证：过滤掉与问题不真正相关的文档片段
+// 通过检查文档内容是否真正包含问题的核心信息来判断相关性
+func (r *RAG) filterRelevantResults(question string, results []schema.Document) []schema.Document {
+	if len(results) == 0 {
+		return results
+	}
+
+	// 提取问题的核心关键词（去除停用词）
+	lowerQuestion := strings.ToLower(question)
+	stopWords := map[string]bool{
+		"的": true, "有": true, "几": true, "条": true, "是": true,
+		"在": true, "和": true, "或": true, "与": true, "什么": true,
+		"怎么": true, "如何": true, "哪些": true, "？": true,
+		"?": true, "：": true, ":": true, "，": true, ",": true,
+		"。": true, ".": true, "！": true, "!": true,
+	}
+
+	// 提取核心关键词（去除停用词后的连续字符）
+	coreKeywords := []string{}
+	runes := []rune(lowerQuestion)
+	currentKeyword := ""
+	for _, r := range runes {
+		char := string(r)
+		if !stopWords[char] && char != " " {
+			currentKeyword += char
+		} else {
+			if len(currentKeyword) >= 2 {
+				coreKeywords = append(coreKeywords, currentKeyword)
+			}
+			currentKeyword = ""
+		}
+	}
+	if len(currentKeyword) >= 2 {
+		coreKeywords = append(coreKeywords, currentKeyword)
+	}
+
+	// 如果无法提取关键词，返回所有结果
+	if len(coreKeywords) == 0 {
+		fmt.Printf("[调试] 无法提取核心关键词，保留所有结果\n")
+		return results
+	}
+
+	fmt.Printf("[调试] 提取的核心关键词: %v\n", coreKeywords)
+
+	// 过滤结果：只保留包含至少一个核心关键词的片段
+	filtered := make([]schema.Document, 0, len(results))
+	for i, doc := range results {
+		lowerContent := strings.ToLower(doc.PageContent)
+		contentNoSpace := strings.ReplaceAll(lowerContent, " ", "")
+
+		// 检查是否包含至少一个核心关键词
+		hasRelevantKeyword := false
+		for _, keyword := range coreKeywords {
+			keywordNoSpace := strings.ReplaceAll(keyword, " ", "")
+			if strings.Contains(lowerContent, keyword) || strings.Contains(contentNoSpace, keywordNoSpace) {
+				hasRelevantKeyword = true
+				break
+			}
+		}
+
+		if hasRelevantKeyword {
+			filtered = append(filtered, doc)
+		} else {
+			fmt.Printf("[调试] 过滤掉片段 %d（不包含核心关键词）\n", i+1)
+		}
+	}
+
+	// 如果过滤后没有结果，至少保留前3个（避免完全无结果）
+	if len(filtered) == 0 && len(results) > 0 {
+		fmt.Printf("[警告] 相关性过滤后没有结果，保留前3个原始结果\n")
+		maxKeep := 3
+		if len(results) < maxKeep {
+			maxKeep = len(results)
+		}
+		return results[:maxKeep]
+	}
+
+	fmt.Printf("[调试] 相关性过滤：从 %d 个结果过滤到 %d 个相关结果\n", len(results), len(filtered))
+	return filtered
 }
 
 // getCircleNumber 获取圆圈数字（①、②、③等）
