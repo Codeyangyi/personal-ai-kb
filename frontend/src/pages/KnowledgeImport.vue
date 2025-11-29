@@ -194,7 +194,8 @@
 import { ref, onMounted, computed } from 'vue'
 import axios from 'axios'
 
-const API_BASE = '/api'
+   const API_BASE = '/api'
+ //const API_BASE = '/rest/api'
 const fileInput = ref(null)
 const selectedFiles = ref([])
 const isDragging = ref(false)
