@@ -612,16 +612,15 @@ func (r *RAG) AddDocuments(ctx context.Context, docs []schema.Document) error {
 	}
 
 	// 根据文档数量自动调整批次大小
-	// 注意：硅基流动API最大批次大小为32，但为了避免触发TPM（每分钟token数）限制
-	// 需要减小批次大小并增加延迟
-	// 少量文档使用较小批次，大量文档使用更小的批次以避免速率限制
+	// 注意：硅基流动API最大批次大小为32，我们使用30以留出安全余量
+	// 优化：增加批次大小以提高处理速度，同时保持合理的速率限制控制
 	var batchSize int
 	if len(docs) < 50 {
-		batchSize = 10 // 少量文档：10个/批（减小批次避免速率限制）
+		batchSize = 20 // 少量文档：20个/批（提高速度）
 	} else if len(docs) < 200 {
-		batchSize = 15 // 中等文档：15个/批（减小批次避免速率限制）
+		batchSize = 25 // 中等文档：25个/批（提高速度）
 	} else {
-		batchSize = 10 // 大量文档：10个/批（减小批次避免触发TPM限制）
+		batchSize = 30 // 大量文档：30个/批（接近API限制，最大化吞吐量）
 	}
 
 	totalBatches := (len(docs) + batchSize - 1) / batchSize
@@ -678,14 +677,14 @@ func (r *RAG) AddDocuments(ctx context.Context, docs []schema.Document) error {
 		}
 
 		// 批次之间添加延迟，避免触发速率限制
-		// 根据批次大小计算延迟时间（每个文档约0.1秒延迟）
+		// 优化：减少延迟时间以提高处理速度（从100ms/文档降到50ms/文档）
 		if batchNum < totalBatches {
-			delay := time.Duration(len(batch)) * 100 * time.Millisecond // 每个文档100ms延迟
-			if delay > 2*time.Second {
-				delay = 2 * time.Second // 最大延迟2秒
+			delay := time.Duration(len(batch)) * 50 * time.Millisecond // 每个文档50ms延迟（优化：从100ms降低）
+			if delay > 1*time.Second {
+				delay = 1 * time.Second // 最大延迟1秒（优化：从2秒降低）
 			}
-			if delay < 500*time.Millisecond {
-				delay = 500 * time.Millisecond // 最小延迟500ms
+			if delay < 200*time.Millisecond {
+				delay = 200 * time.Millisecond // 最小延迟200ms（优化：从500ms降低）
 			}
 			time.Sleep(delay)
 		}

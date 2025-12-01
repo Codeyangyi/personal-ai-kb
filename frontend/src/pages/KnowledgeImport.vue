@@ -310,6 +310,7 @@ async function handleUpload() {
         'Content-Type': 'multipart/form-data',
         'Authorization': `Bearer ${token}`
       },
+      timeout: 600000, // 10分钟超时（600000毫秒），用于处理大文件和向量化
       onUploadProgress: (progressEvent) => {
         if (progressEvent.total) {
           uploadProgress.value = Math.round((progressEvent.loaded * 100) / progressEvent.total)
@@ -331,7 +332,22 @@ async function handleUpload() {
     }
   } catch (error) {
     console.error('上传失败:', error)
-    alert('上传失败: ' + (error.response?.data?.error || error.message))
+    
+    // 提供更友好的错误提示
+    let errorMessage = '上传失败: '
+    if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+      errorMessage = '上传超时：文件处理时间过长。\n\n建议：\n1. 尝试减小文件大小或分批上传\n2. 检查网络连接\n3. 如果文件很大，向量化可能需要较长时间，请耐心等待'
+    } else if (error.response?.status === 413 || error.message?.includes('too large')) {
+      errorMessage = '文件过大：单个文件或总大小超过限制（最大500MB）\n\n建议：\n1. 减小文件大小\n2. 分批上传文件'
+    } else if (error.response?.data?.error) {
+      errorMessage += error.response.data.error
+    } else if (error.message) {
+      errorMessage += error.message
+    } else {
+      errorMessage += '未知错误，请检查网络连接或稍后重试'
+    }
+    
+    alert(errorMessage)
   } finally {
     uploading.value = false
   }

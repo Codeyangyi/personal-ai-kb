@@ -246,7 +246,7 @@ func (s *QdrantStore) AddDocuments(ctx context.Context, docs []schema.Document, 
 		cleanedDocs[i] = docs[i]
 		cleanedDocs[i].PageContent = cleanTextEncoding(docs[i].PageContent)
 	}
-	
+
 	_, err := s.store.AddDocuments(ctx, cleanedDocs, vectorstores.WithEmbedder(embedder))
 	return err
 }
@@ -264,7 +264,7 @@ func cleanTextEncoding(text string) string {
 	// 逐字符处理，确保所有字符都是有效的UTF-8
 	for len(text) > 0 {
 		r, size := utf8.DecodeRuneInString(text)
-		
+
 		// 处理无效的UTF-8字符
 		if r == utf8.RuneError && size == 1 {
 			// 遇到无效的UTF-8字符，跳过
@@ -305,7 +305,7 @@ func cleanTextEncoding(text string) string {
 	// 清理连续的乱码字符模式
 	// 移除连续的无效字符序列
 	text = strings.ReplaceAll(text, "\uFFFD", " ")
-	
+
 	// 清理多余的空白字符
 	for strings.Contains(text, "  ") {
 		text = strings.ReplaceAll(text, "  ", " ")

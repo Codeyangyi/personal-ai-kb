@@ -193,9 +193,18 @@ func (s *Server) Start(port string) error {
 
 	handler := corsMiddleware(mux)
 
-	addr := ":" + port
-	log.Printf("服务器启动在 http://localhost%s", addr)
-	return http.ListenAndServe(addr, handler)
+	// 创建HTTP服务器并设置超时时间
+	// 优化：增加超时时间以支持大文件上传和长时间向量化
+	server := &http.Server{
+		Addr:         ":" + port,
+		Handler:      handler,
+		ReadTimeout:  30 * time.Minute,  // 读取超时：30分钟（用于大文件上传）
+		WriteTimeout: 30 * time.Minute,  // 写入超时：30分钟（用于向量化响应）
+		IdleTimeout:  120 * time.Second, // 空闲连接超时：2分钟
+	}
+
+	log.Printf("服务器启动在 http://localhost%s (超时设置: 读取/写入30分钟)", server.Addr)
+	return server.ListenAndServe()
 }
 
 // handleHealth 健康检查
@@ -249,9 +258,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 解析multipart form
-	err := r.ParseMultipartForm(32 << 20) // 32MB
+	// 优化：统一文件大小限制为500MB，与批量上传保持一致
+	err := r.ParseMultipartForm(500 << 20) // 500MB（从32MB增加到500MB，与批量上传保持一致）
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to parse form: %v", err), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("Failed to parse form: %v (文件可能过大，最大支持500MB)", err), http.StatusBadRequest)
 		return
 	}
 
@@ -302,7 +312,26 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	docs, err := fileLoader.Load(savedPath)
 	if err != nil {
 		os.Remove(savedPath)
-		http.Error(w, fmt.Sprintf("Failed to load document: %v", err), http.StatusInternalServerError)
+		// 优化：提供更友好的错误信息（与批量上传保持一致）
+		errMsg := err.Error()
+		userFriendlyMsg := errMsg
+		if strings.Contains(errMsg, "加密") || strings.Contains(errMsg, "password") {
+			userFriendlyMsg = "PDF文件已加密或受密码保护，请先移除密码保护"
+		} else if strings.Contains(errMsg, "损坏") || strings.Contains(errMsg, "corrupt") {
+			userFriendlyMsg = "PDF文件可能已损坏，请尝试重新保存文件"
+		} else if strings.Contains(errMsg, "扫描版") || strings.Contains(errMsg, "OCR") {
+			userFriendlyMsg = "扫描版PDF（纯图片），无法提取文本，请使用OCR工具提取文本"
+		} else if strings.Contains(errMsg, "empty") {
+			userFriendlyMsg = "PDF文件为空"
+		} else if strings.Contains(errMsg, "too large") {
+			userFriendlyMsg = "PDF文件过大（最大500MB）"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  false,
+			"message":  fmt.Sprintf("加载文档失败: %s", userFriendlyMsg),
+			"filename": header.Filename,
+		})
 		return
 	}
 
@@ -332,8 +361,15 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// 添加到知识库
 	ctx := context.Background()
 	if err := s.ragSystem.AddDocuments(ctx, chunks); err != nil {
+		// 向量化失败：删除已保存的文件（保持与批量上传的逻辑一致）
 		os.Remove(savedPath)
-		http.Error(w, fmt.Sprintf("Failed to add documents: %v", err), http.StatusInternalServerError)
+		log.Printf("向量化失败，已删除文件: %s, 错误: %v", savedPath, err)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  false,
+			"message":  fmt.Sprintf("文件处理成功，但向量化失败: %v。文件已自动删除，请稍后重试。", err),
+			"filename": header.Filename,
+		})
 		return
 	}
 
@@ -373,9 +409,10 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 解析multipart form
-	err := r.ParseMultipartForm(100 << 20) // 100MB
+	// 优化：增加文件大小限制到500MB，支持更大的文件上传
+	err := r.ParseMultipartForm(500 << 20) // 500MB（从100MB增加到500MB）
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to parse form: %v", err), http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("Failed to parse form: %v (文件可能过大，最大支持500MB)", err), http.StatusBadRequest)
 		return
 	}
 
@@ -408,7 +445,7 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 			results = append(results, FileResult{
 				Filename: fileHeader.Filename,
 				Success:  false,
-				Message:  fmt.Sprintf("文件已存在，请勿重复上传"),
+				Message:  "文件已存在，请勿重复上传",
 			})
 			failCount++
 			continue
@@ -1066,9 +1103,7 @@ func (s *Server) checkAdminAuth(r *http.Request) bool {
 	token := r.Header.Get("Authorization")
 	if token != "" {
 		// 支持 "Bearer token" 格式
-		if strings.HasPrefix(token, "Bearer ") {
-			token = strings.TrimPrefix(token, "Bearer ")
-		}
+		token = strings.TrimPrefix(token, "Bearer ")
 		return token == s.adminToken
 	}
 

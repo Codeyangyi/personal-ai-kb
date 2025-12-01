@@ -65,9 +65,16 @@ func NewSiliconFlowEmbedder(apiKey, model string) (*SiliconFlowEmbedder, error) 
 }
 
 // EmbedDocuments 批量向量化文档
+// 注意：硅基流动API最大批次大小为32，超过此限制会导致错误
 func (s *SiliconFlowEmbedder) EmbedDocuments(ctx context.Context, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return nil, fmt.Errorf("文本列表不能为空")
+	}
+
+	// 安全检查：确保批次大小不超过API限制（32）
+	const maxBatchSize = 32
+	if len(texts) > maxBatchSize {
+		return nil, fmt.Errorf("批次大小 (%d) 超过API限制 (%d)，请减小批次大小", len(texts), maxBatchSize)
 	}
 
 	// 构建请求
@@ -91,8 +98,14 @@ func (s *SiliconFlowEmbedder) EmbedDocuments(ctx context.Context, texts []string
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
 
 	// 发送请求
+	// 优化：使用连接池和更长的超时时间以提高性能
 	client := &http.Client{
-		Timeout: 60 * time.Second, // 设置超时时间
+		Timeout: 120 * time.Second, // 增加超时时间到120秒（优化：从60秒增加）
+		Transport: &http.Transport{
+			MaxIdleConns:        100,              // 最大空闲连接数
+			MaxIdleConnsPerHost: 10,               // 每个主机的最大空闲连接数
+			IdleConnTimeout:     90 * time.Second, // 空闲连接超时
+		},
 	}
 
 	resp, err := client.Do(req)
@@ -138,13 +151,13 @@ func (s *SiliconFlowEmbedder) EmbedDocuments(ctx context.Context, texts []string
 
 			if errorMsg != "" {
 				// 检查是否是速率限制错误
-				if strings.Contains(errorMsg, "rate limiting") || 
-				   strings.Contains(errorMsg, "rate limit") ||
-				   strings.Contains(errorMsg, "TPM limit") ||
-				   strings.Contains(errorMsg, "tokens per minute") {
+				if strings.Contains(errorMsg, "rate limiting") ||
+					strings.Contains(errorMsg, "rate limit") ||
+					strings.Contains(errorMsg, "TPM limit") ||
+					strings.Contains(errorMsg, "tokens per minute") {
 					return nil, fmt.Errorf("API速率限制: %s (错误码: %d)\n建议：1) 减少批次大小 2) 增加批次之间的延迟 3) 等待一段时间后重试", errorMsg, errorResp.Code)
 				}
-				
+
 				if errorResp.Code == 20012 || strings.Contains(errorMsg, "不存在") || strings.Contains(errorMsg, "does not exist") {
 					return nil, fmt.Errorf("模型 '%s' 不存在。\n错误信息: %s (错误码: %d)\n\n请访问 https://siliconflow.cn/ 查看可用的embedding模型列表。", s.model, errorMsg, errorResp.Code)
 				}
