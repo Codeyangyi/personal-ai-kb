@@ -37,14 +37,15 @@ type FileInfo struct {
 
 // Server HTTP API服务器
 type Server struct {
-	ragSystem  *rag.RAG
-	config     *config.Config
-	embedder   *embedding.Embedder
-	store      *store.QdrantStore
-	llm        llm.LLM
-	adminToken string
-	filesDir   string
-	files      map[string]*FileInfo // 文件ID -> 文件信息
+	ragSystem     *rag.RAG
+	config        *config.Config
+	embedder      *embedding.Embedder
+	store         *store.QdrantStore
+	llm           llm.LLM
+	adminToken    string
+	filesDir      string
+	failedFilesDir string // 失败文件目录
+	files         map[string]*FileInfo // 文件ID -> 文件信息
 }
 
 // NewServer 创建新的API服务器
@@ -107,15 +108,22 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("创建文件存储目录失败: %v", err)
 	}
 
+	// 创建失败文件存储目录
+	failedFilesDir := filepath.Join(filesDir, "failed")
+	if err := os.MkdirAll(failedFilesDir, 0755); err != nil {
+		return nil, fmt.Errorf("创建失败文件存储目录失败: %v", err)
+	}
+
 	server := &Server{
-		ragSystem:  ragSystem,
-		config:     cfg,
-		embedder:   embedder,
-		store:      vectorStore,
-		llm:        llmClient,
-		adminToken: adminToken,
-		filesDir:   filesDir,
-		files:      make(map[string]*FileInfo),
+		ragSystem:     ragSystem,
+		config:        cfg,
+		embedder:      embedder,
+		store:         vectorStore,
+		llm:           llmClient,
+		adminToken:    adminToken,
+		filesDir:      filesDir,
+		failedFilesDir: failedFilesDir,
+		files:         make(map[string]*FileInfo),
 	}
 
 	// 从磁盘恢复文件列表
@@ -311,7 +319,6 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	fileLoader := loader.NewFileLoader()
 	docs, err := fileLoader.Load(savedPath)
 	if err != nil {
-		os.Remove(savedPath)
 		// 优化：提供更友好的错误信息（与批量上传保持一致）
 		errMsg := err.Error()
 		userFriendlyMsg := errMsg
@@ -326,10 +333,18 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		} else if strings.Contains(errMsg, "too large") {
 			userFriendlyMsg = "PDF文件过大（最大500MB）"
 		}
+		
+		// 保存失败文件到失败目录
+		failureReason := fmt.Sprintf("加载文档失败: %s", userFriendlyMsg)
+		if saveErr := s.saveFailedFile(savedPath, header.Filename, failureReason); saveErr != nil {
+			log.Printf("保存失败文件时出错: %v", saveErr)
+			os.Remove(savedPath) // 如果保存失败，删除原文件
+		}
+		
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success":  false,
-			"message":  fmt.Sprintf("加载文档失败: %s", userFriendlyMsg),
+			"message":  failureReason,
 			"filename": header.Filename,
 		})
 		return
@@ -353,7 +368,12 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	textSplitter := splitter.NewTextSplitter(s.config.ChunkSize, s.config.ChunkOverlap)
 	chunks, err := textSplitter.SplitDocuments(docs)
 	if err != nil {
-		os.Remove(savedPath)
+		// 保存失败文件到失败目录
+		failureReason := fmt.Sprintf("切分文档失败: %v", err)
+		if saveErr := s.saveFailedFile(savedPath, header.Filename, failureReason); saveErr != nil {
+			log.Printf("保存失败文件时出错: %v", saveErr)
+			os.Remove(savedPath) // 如果保存失败，删除原文件
+		}
 		http.Error(w, fmt.Sprintf("Failed to split document: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -361,13 +381,17 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	// 添加到知识库
 	ctx := context.Background()
 	if err := s.ragSystem.AddDocuments(ctx, chunks); err != nil {
-		// 向量化失败：删除已保存的文件（保持与批量上传的逻辑一致）
-		os.Remove(savedPath)
-		log.Printf("向量化失败，已删除文件: %s, 错误: %v", savedPath, err)
+		// 向量化失败：保存失败文件到失败目录
+		failureReason := fmt.Sprintf("向量化失败: %v", err)
+		if saveErr := s.saveFailedFile(savedPath, header.Filename, failureReason); saveErr != nil {
+			log.Printf("保存失败文件时出错: %v", saveErr)
+			os.Remove(savedPath) // 如果保存失败，删除原文件
+		}
+		log.Printf("向量化失败，已保存失败文件: %s, 错误: %v", savedPath, err)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success":  false,
-			"message":  fmt.Sprintf("文件处理成功，但向量化失败: %v。文件已自动删除，请稍后重试。", err),
+			"message":  fmt.Sprintf("文件处理成功，但向量化失败: %v。文件已保存到失败目录，请稍后重试。", err),
 			"filename": header.Filename,
 		})
 		return
@@ -491,12 +515,17 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 		savedFile.Close()
 
 		if err != nil {
-			os.Remove(savedPath)
+			// 保存失败文件到失败目录
+			failureReason := fmt.Sprintf("保存文件失败: %v", err)
+			if saveErr := s.saveFailedFile(savedPath, fileHeader.Filename, failureReason); saveErr != nil {
+				log.Printf("保存失败文件时出错: %v", saveErr)
+				os.Remove(savedPath) // 如果保存失败，删除原文件
+			}
 			log.Printf("Failed to save file %s: %v", fileHeader.Filename, err)
 			results = append(results, FileResult{
 				Filename: fileHeader.Filename,
 				Success:  false,
-				Message:  fmt.Sprintf("保存文件失败: %v", err),
+				Message:  failureReason,
 			})
 			failCount++
 			continue
@@ -505,7 +534,6 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 		// 加载文档
 		docs, err := fileLoader.Load(savedPath)
 		if err != nil {
-			os.Remove(savedPath)
 			log.Printf("Failed to load document %s: %v", fileHeader.Filename, err)
 			// 提取更友好的错误信息
 			errMsg := err.Error()
@@ -521,10 +549,18 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 			} else if strings.Contains(errMsg, "too large") {
 				userFriendlyMsg = "PDF文件过大（最大100MB）"
 			}
+			
+			// 保存失败文件到失败目录
+			failureReason := fmt.Sprintf("加载文档失败: %s", userFriendlyMsg)
+			if saveErr := s.saveFailedFile(savedPath, fileHeader.Filename, failureReason); saveErr != nil {
+				log.Printf("保存失败文件时出错: %v", saveErr)
+				os.Remove(savedPath) // 如果保存失败，删除原文件
+			}
+			
 			results = append(results, FileResult{
 				Filename: fileHeader.Filename,
 				Success:  false,
-				Message:  fmt.Sprintf("加载文档失败: %s", userFriendlyMsg),
+				Message:  failureReason,
 			})
 			failCount++
 			continue
@@ -547,12 +583,17 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 		// 切分文档
 		chunks, err := textSplitter.SplitDocuments(docs)
 		if err != nil {
-			os.Remove(savedPath)
+			// 保存失败文件到失败目录
+			failureReason := fmt.Sprintf("切分文档失败: %v", err)
+			if saveErr := s.saveFailedFile(savedPath, fileHeader.Filename, failureReason); saveErr != nil {
+				log.Printf("保存失败文件时出错: %v", saveErr)
+				os.Remove(savedPath) // 如果保存失败，删除原文件
+			}
 			log.Printf("Failed to split document %s: %v", fileHeader.Filename, err)
 			results = append(results, FileResult{
 				Filename: fileHeader.Filename,
 				Success:  false,
-				Message:  fmt.Sprintf("切分文档失败: %v", err),
+				Message:  failureReason,
 			})
 			failCount++
 			continue
@@ -592,7 +633,35 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 		if err := s.ragSystem.AddDocuments(ctx, allChunks); err != nil {
 			log.Printf("向量化失败: %v", err)
 			vectorizationError = err
-			// 即使向量化失败，也返回文件处理结果，但标记向量化失败
+			
+			// 向量化失败时，将所有成功处理的文件移动到失败目录
+			failureReason := fmt.Sprintf("向量化失败: %v", err)
+			for i := range results {
+				result := &results[i]
+				if result.Success && result.FileID != "" {
+					// 查找对应的文件路径
+					if fileInfo, exists := s.files[result.FileID]; exists {
+						// 构建文件路径
+						cleanedFilename := strings.ReplaceAll(fileInfo.Filename, "/", "_")
+						cleanedFilename = strings.ReplaceAll(cleanedFilename, "\\", "_")
+						cleanedFilename = strings.ReplaceAll(cleanedFilename, "..", "_")
+						filePath := filepath.Join(s.filesDir, result.FileID+"_"+cleanedFilename)
+						
+						// 保存失败文件
+						if saveErr := s.saveFailedFile(filePath, fileInfo.Filename, failureReason); saveErr != nil {
+							log.Printf("保存失败文件时出错: %v", saveErr)
+						} else {
+							// 从文件列表中删除
+							delete(s.files, result.FileID)
+							// 更新结果状态
+							result.Success = false
+							result.Message = failureReason
+							successCount--
+							failCount++
+						}
+					}
+				}
+			}
 		} else {
 			log.Printf("向量化成功，共处理 %d 个文本块", len(allChunks))
 			vectorizedChunks = len(allChunks)
@@ -1095,6 +1164,84 @@ func (s *Server) deleteDocumentsBySource(ctx context.Context, sourcePath string)
 
 	log.Printf("注意：向量数据库中的文档（source=%s）需要手动清理或通过Qdrant API删除", sourcePath)
 	return nil
+}
+
+// saveFailedFile 保存失败的文件到失败目录，并记录失败原因
+func (s *Server) saveFailedFile(filePath, originalFilename, reason string) error {
+	// 确保失败目录存在
+	if err := os.MkdirAll(s.failedFilesDir, 0755); err != nil {
+		return fmt.Errorf("创建失败文件目录失败: %v", err)
+	}
+
+	// 生成失败文件的文件名：{timestamp}_{原文件名}_{失败原因摘要}.{扩展名}
+	// 失败原因摘要：取前20个字符，去除特殊字符
+	reasonSummary := strings.ReplaceAll(reason, "/", "_")
+	reasonSummary = strings.ReplaceAll(reasonSummary, "\\", "_")
+	reasonSummary = strings.ReplaceAll(reasonSummary, ":", "_")
+	reasonSummary = strings.ReplaceAll(reasonSummary, "*", "_")
+	reasonSummary = strings.ReplaceAll(reasonSummary, "?", "_")
+	reasonSummary = strings.ReplaceAll(reasonSummary, "\"", "_")
+	reasonSummary = strings.ReplaceAll(reasonSummary, "<", "_")
+	reasonSummary = strings.ReplaceAll(reasonSummary, ">", "_")
+	reasonSummary = strings.ReplaceAll(reasonSummary, "|", "_")
+	if len(reasonSummary) > 50 {
+		reasonSummary = reasonSummary[:50]
+	}
+
+	ext := filepath.Ext(originalFilename)
+	nameWithoutExt := strings.TrimSuffix(originalFilename, ext)
+	timestamp := time.Now().Format("20060102_150405")
+	
+	// 清理文件名中的危险字符
+	cleanedName := strings.ReplaceAll(nameWithoutExt, "/", "_")
+	cleanedName = strings.ReplaceAll(cleanedName, "\\", "_")
+	cleanedName = strings.ReplaceAll(cleanedName, "..", "_")
+	
+	failedFilename := fmt.Sprintf("%s_%s_[失败]_%s%s", timestamp, cleanedName, reasonSummary, ext)
+	failedPath := filepath.Join(s.failedFilesDir, failedFilename)
+
+	// 如果文件不存在，直接返回（可能已经被删除）
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return fmt.Errorf("源文件不存在: %s", filePath)
+	}
+
+	// 移动文件到失败目录
+	if err := os.Rename(filePath, failedPath); err != nil {
+		// 如果重命名失败（可能跨文件系统），尝试复制后删除
+		if err := s.copyFile(filePath, failedPath); err != nil {
+			return fmt.Errorf("移动失败文件失败: %v", err)
+		}
+		os.Remove(filePath) // 删除原文件
+	}
+
+	// 创建失败原因记录文件（JSON格式）
+	reasonFile := strings.TrimSuffix(failedPath, ext) + "_失败原因.txt"
+	reasonContent := fmt.Sprintf("文件名: %s\n失败时间: %s\n失败原因: %s\n", originalFilename, time.Now().Format("2006-01-02 15:04:05"), reason)
+	if err := os.WriteFile(reasonFile, []byte(reasonContent), 0644); err != nil {
+		log.Printf("保存失败原因文件失败: %v", err)
+		// 不返回错误，因为文件已经移动成功
+	}
+
+	log.Printf("失败文件已保存: %s, 原因: %s", failedPath, reason)
+	return nil
+}
+
+// copyFile 复制文件（用于跨文件系统移动）
+func (s *Server) copyFile(src, dst string) error {
+	sourceFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer sourceFile.Close()
+
+	destFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destFile.Close()
+
+	_, err = io.Copy(destFile, sourceFile)
+	return err
 }
 
 // checkAdminAuth 检查管理员权限
