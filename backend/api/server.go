@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,6 +23,8 @@ import (
 	"github.com/Codeyangyi/personal-ai-kb/store"
 	"github.com/google/uuid"
 	"github.com/tmc/langchaingo/schema"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
 // FileInfo 文件信息
@@ -46,6 +49,7 @@ type Server struct {
 	filesDir      string
 	failedFilesDir string // 失败文件目录
 	files         map[string]*FileInfo // 文件ID -> 文件信息
+	db            *sql.DB              // MySQL 连接（用于业务数据，如意见反馈）
 }
 
 // NewServer 创建新的API服务器
@@ -95,6 +99,35 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	// 创建RAG系统
 	ragSystem := rag.NewRAG(embedder, vectorStore, llmClient, 3)
 
+	// 初始化 MySQL（可选）
+	var db *sql.DB
+	if cfg.MySQLDSN != "" {
+		var err error
+		db, err = sql.Open("mysql", cfg.MySQLDSN)
+		if err != nil {
+			return nil, fmt.Errorf("连接 MySQL 失败: %v", err)
+		}
+		if err := db.Ping(); err != nil {
+			return nil, fmt.Errorf("MySQL 连接测试失败: %v", err)
+		}
+
+		// 创建意见反馈表（如果不存在）
+		createTableSQL := `CREATE TABLE IF NOT EXISTS feedbacks (
+	id BIGINT AUTO_INCREMENT PRIMARY KEY,
+	name VARCHAR(100) NOT NULL,
+	title VARCHAR(255) NOT NULL,
+	description TEXT NOT NULL,
+	image VARCHAR(512) NULL,
+	created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`
+		if _, err := db.Exec(createTableSQL); err != nil {
+			return nil, fmt.Errorf("创建反馈表失败: %v", err)
+		}
+		log.Println("MySQL 已连接，反馈表初始化成功")
+	} else {
+		log.Println("未配置 MYSQL_DSN，意见反馈将不会写入数据库")
+	}
+
 	// 获取管理员token（从环境变量或配置）
 	adminToken := os.Getenv("ADMIN_TOKEN")
 	if adminToken == "" {
@@ -115,15 +148,16 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	}
 
 	server := &Server{
-		ragSystem:     ragSystem,
-		config:        cfg,
-		embedder:      embedder,
-		store:         vectorStore,
-		llm:           llmClient,
-		adminToken:    adminToken,
-		filesDir:      filesDir,
+		ragSystem:      ragSystem,
+		config:         cfg,
+		embedder:       embedder,
+		store:          vectorStore,
+		llm:            llmClient,
+		adminToken:     adminToken,
+		filesDir:       filesDir,
 		failedFilesDir: failedFilesDir,
-		files:         make(map[string]*FileInfo),
+		files:          make(map[string]*FileInfo),
+		db:             db,
 	}
 
 	// 从磁盘恢复文件列表
@@ -157,6 +191,7 @@ func (s *Server) Start(port string) error {
 	mux.HandleFunc("/api/upload", s.handleUpload)
 	mux.HandleFunc("/api/upload-batch", s.handleBatchUpload)
 	mux.HandleFunc("/api/query", s.handleQuery)
+	mux.HandleFunc("/api/feedback", s.handleFeedback)
 	mux.HandleFunc("/api/check-admin", s.handleCheckAdmin)
 	mux.HandleFunc("/api/files", s.handleFileList)
 	mux.HandleFunc("/api/files/", func(w http.ResponseWriter, r *http.Request) {
@@ -1164,6 +1199,88 @@ func (s *Server) deleteDocumentsBySource(ctx context.Context, sourcePath string)
 
 	log.Printf("注意：向量数据库中的文档（source=%s）需要手动清理或通过Qdrant API删除", sourcePath)
 	return nil
+}
+
+// handleFeedback 处理意见反馈提交，将数据写入 MySQL
+func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 必须配置 MySQL 才能使用反馈功能
+	if s.db == nil {
+		http.Error(w, "Feedback database not configured (缺少 MYSQL_DSN)", http.StatusInternalServerError)
+		return
+	}
+
+	// 解析表单（包括可选图片）
+	if err := r.ParseMultipartForm(10 << 20); err != nil { // 10MB
+		http.Error(w, fmt.Sprintf("解析表单失败: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	name := strings.TrimSpace(r.FormValue("name"))
+	title := strings.TrimSpace(r.FormValue("title"))
+	description := strings.TrimSpace(r.FormValue("description"))
+
+	if name == "" || title == "" || description == "" {
+		http.Error(w, "姓名、标题、详细描述为必填项", http.StatusBadRequest)
+		return
+	}
+
+	// 图片（可选）：保存到本地目录，并在数据库中记录相对路径
+	var imagePath sql.NullString
+	file, header, err := r.FormFile("image")
+	if err == nil && header != nil {
+		defer file.Close()
+
+		// 创建图片保存目录：./uploads/feedback-images
+		imageDir := filepath.Join(s.filesDir, "feedback-images")
+		if err := os.MkdirAll(imageDir, 0755); err != nil {
+			log.Printf("创建反馈图片目录失败: %v", err)
+		} else {
+			// 使用时间戳+原始文件名，避免重名
+			ext := filepath.Ext(header.Filename)
+			nameWithoutExt := strings.TrimSuffix(header.Filename, ext)
+			nameWithoutExt = strings.ReplaceAll(nameWithoutExt, "/", "_")
+			nameWithoutExt = strings.ReplaceAll(nameWithoutExt, "\\", "_")
+			nameWithoutExt = strings.ReplaceAll(nameWithoutExt, "..", "_")
+			timestamp := time.Now().Format("20060102_150405")
+			savedName := fmt.Sprintf("%s_%s%s", timestamp, nameWithoutExt, ext)
+
+			fullPath := filepath.Join(imageDir, savedName)
+			out, err := os.Create(fullPath)
+			if err != nil {
+				log.Printf("保存反馈图片失败: %v", err)
+			} else {
+				if _, err := io.Copy(out, file); err != nil {
+					log.Printf("写入反馈图片失败: %v", err)
+				} else {
+					// 在数据库中记录相对路径（相对于 backend 根目录）
+					relPath := filepath.ToSlash(filepath.Join("uploads", "feedback-images", savedName))
+					imagePath.String = relPath
+					imagePath.Valid = true
+				}
+				out.Close()
+			}
+		}
+	}
+
+	// 写入 MySQL
+	query := `INSERT INTO feedbacks (name, title, description, image, created_at) VALUES (?, ?, ?, ?, ?)`
+	_, err = s.db.Exec(query, name, title, description, imagePath, time.Now())
+	if err != nil {
+		log.Printf("保存反馈失败: %v", err)
+		http.Error(w, fmt.Sprintf("保存反馈失败: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": "感谢您的反馈！已成功保存。",
+	})
 }
 
 // saveFailedFile 保存失败的文件到失败目录，并记录失败原因

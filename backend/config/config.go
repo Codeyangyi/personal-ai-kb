@@ -34,6 +34,9 @@ type Config struct {
 	// 服务器配置
 	ServerMode string // 默认运行模式: "server", "query", "load", "load-dir"
 	ServerPort string // 服务器端口
+
+	// MySQL 配置（用于意见反馈等业务数据存储）
+	MySQLDSN string // 例如: user:password@tcp(127.0.0.1:3306)/dbname?charset=utf8mb4&parseTime=true&loc=Local
 }
 
 // LoadConfig 从环境变量加载配置
@@ -69,7 +72,10 @@ func LoadConfig() *Config {
 
 		// 服务器配置（默认启动服务器模式）
 		ServerMode: getEnv("SERVER_MODE", "server"), // 默认模式: server（启动API服务器）
-		ServerPort: getEnv("SERVER_PORT", "8005"),   // 默认端口: 8080
+		ServerPort: getEnv("SERVER_PORT", "8005"),   // 默认端口: 8005
+
+		// MySQL 配置（可选，如果不配置则不启用数据库相关功能）
+		MySQLDSN: getEnv("MYSQL_DSN", "root:123456@tcp(127.0.0.1:3306)/ai_kb?charset=utf8mb4"),
 	}
 }
 
