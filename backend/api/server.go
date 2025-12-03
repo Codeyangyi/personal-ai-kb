@@ -1290,32 +1290,29 @@ func (s *Server) saveFailedFile(filePath, originalFilename, reason string) error
 		return fmt.Errorf("创建失败文件目录失败: %v", err)
 	}
 
-	// 生成失败文件的文件名：{timestamp}_{原文件名}_{失败原因摘要}.{扩展名}
-	// 失败原因摘要：取前20个字符，去除特殊字符
-	reasonSummary := strings.ReplaceAll(reason, "/", "_")
-	reasonSummary = strings.ReplaceAll(reasonSummary, "\\", "_")
-	reasonSummary = strings.ReplaceAll(reasonSummary, ":", "_")
-	reasonSummary = strings.ReplaceAll(reasonSummary, "*", "_")
-	reasonSummary = strings.ReplaceAll(reasonSummary, "?", "_")
-	reasonSummary = strings.ReplaceAll(reasonSummary, "\"", "_")
-	reasonSummary = strings.ReplaceAll(reasonSummary, "<", "_")
-	reasonSummary = strings.ReplaceAll(reasonSummary, ">", "_")
-	reasonSummary = strings.ReplaceAll(reasonSummary, "|", "_")
-	if len(reasonSummary) > 50 {
-		reasonSummary = reasonSummary[:50]
-	}
-
 	ext := filepath.Ext(originalFilename)
 	nameWithoutExt := strings.TrimSuffix(originalFilename, ext)
-	timestamp := time.Now().Format("20060102_150405")
 	
 	// 清理文件名中的危险字符
 	cleanedName := strings.ReplaceAll(nameWithoutExt, "/", "_")
 	cleanedName = strings.ReplaceAll(cleanedName, "\\", "_")
 	cleanedName = strings.ReplaceAll(cleanedName, "..", "_")
 	
-	failedFilename := fmt.Sprintf("%s_%s_[失败]_%s%s", timestamp, cleanedName, reasonSummary, ext)
+	// 使用原文件名（清理危险字符后）
+	failedFilename := cleanedName + ext
 	failedPath := filepath.Join(s.failedFilesDir, failedFilename)
+
+	// 如果文件名已存在，添加序号避免冲突
+	counter := 1
+	for {
+		if _, err := os.Stat(failedPath); os.IsNotExist(err) {
+			break // 文件不存在，可以使用这个文件名
+		}
+		// 文件已存在，添加序号
+		failedFilename = fmt.Sprintf("%s_%d%s", cleanedName, counter, ext)
+		failedPath = filepath.Join(s.failedFilesDir, failedFilename)
+		counter++
+	}
 
 	// 如果文件不存在，直接返回（可能已经被删除）
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
@@ -1329,14 +1326,6 @@ func (s *Server) saveFailedFile(filePath, originalFilename, reason string) error
 			return fmt.Errorf("移动失败文件失败: %v", err)
 		}
 		os.Remove(filePath) // 删除原文件
-	}
-
-	// 创建失败原因记录文件（JSON格式）
-	reasonFile := strings.TrimSuffix(failedPath, ext) + "_失败原因.txt"
-	reasonContent := fmt.Sprintf("文件名: %s\n失败时间: %s\n失败原因: %s\n", originalFilename, time.Now().Format("2006-01-02 15:04:05"), reason)
-	if err := os.WriteFile(reasonFile, []byte(reasonContent), 0644); err != nil {
-		log.Printf("保存失败原因文件失败: %v", err)
-		// 不返回错误，因为文件已经移动成功
 	}
 
 	log.Printf("失败文件已保存: %s, 原因: %s", failedPath, reason)

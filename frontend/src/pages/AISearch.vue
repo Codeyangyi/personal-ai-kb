@@ -6,16 +6,21 @@
         <h1>AI 知识 · 问答</h1>
         <p class="sub">输入问题，基于知识库即时检索答案。</p>
       </div>
-      <button class="help-btn" @click="showHelp = true" title="查看使用文档">
-        <span class="help-text">使用文档</span>
-      </button>
+      <div class="action-buttons">
+        <button class="help-btn" @click="showHelp = true" title="查看帮助文档">
+          <span class="help-text">帮助文档</span>
+        </button>
+        <button class="feedback-btn-top" @click="showFeedback = true" title="意见反馈">
+          <span class="feedback-text">意见反馈</span>
+        </button>
+      </div>
     </section>
     <div class="search-panel">
       <form @submit.prevent="handleSearch" class="search-box">
         <input
           type="text"
           v-model="query"
-          placeholder="输入问题，如：申报历史文化名村需要哪些材料？"
+          placeholder="输入问题，如：临时用地使用期限最长能多久？"
           class="search-input"
         />
         <button type="submit" :disabled="!query.trim() || searching" class="search-btn">
@@ -69,7 +74,7 @@
                     <span class="chunk-index">片段 {{ chunk.index || chunkIndex + 1 }}</span>
                     <span v-if="chunk.score" class="result-score">相关度 {{ chunk.score.toFixed(3) }}</span>
                   </div>
-                  <p>{{ chunk.preview || chunk.content || chunk.pageContent }}</p>
+                  <p>{{ chunk.content || chunk.pageContent || chunk.preview }}</p>
                   <div v-if="group.docSource && group.sourceType === 'url'" class="result-source">
                     <small>来源: {{ group.docSource }}</small>
                   </div>
@@ -90,7 +95,7 @@
                 <h3>{{ item.title || '未命名文档' }}</h3>
                 <span v-if="item.score" class="result-score">相关度 {{ item.score.toFixed(3) }}</span>
               </header>
-              <p>{{ item.preview || item.content || item.pageContent }}</p>
+              <p>{{ item.content || item.pageContent || item.preview }}</p>
               <div v-if="item.source" class="result-source">
                 <small>来源: {{ item.source }}</small>
               </div>
@@ -109,11 +114,11 @@
       </div>
     </div>
 
-    <!-- 使用文档弹窗 -->
+    <!-- 帮助文档弹窗 -->
     <div v-if="showHelp" class="help-modal-overlay" @click="showHelp = false">
       <div class="help-modal" @click.stop>
         <div class="help-modal-header">
-          <h2>📖 使用文档</h2>
+          <h2>📖 帮助文档</h2>
           <button class="close-btn" @click="showHelp = false">×</button>
         </div>
         <div class="help-modal-content">
@@ -183,16 +188,12 @@
               <strong>Q: 如何上传文档到知识库？</strong>
               <p>A: 需要管理员权限。请访问"知识库管理"页面，使用管理员token登录后即可上传文档。</p>
             </div>
+             <div class="faq-item">
+              <strong>Q: 如何下载原件？</strong>
+              <p>A: 原件都属于重要的机密文件，如有需要可以联系管理员获取。 </p>
+            </div>
+            
           </section>
-
-          <!-- 意见反馈按钮 -->
-          <div class="feedback-section">
-            <button class="feedback-btn" @click="showFeedback = true">
-              <span class="feedback-icon">💬</span>
-              <span>意见反馈</span>
-            </button>
-            <p class="feedback-hint">您的反馈对我们很重要，帮助我们改进系统</p>
-          </div>
         </div>
       </div>
     </div>
@@ -201,7 +202,7 @@
     <div v-if="showFeedback" class="feedback-modal-overlay" @click="showFeedback = false">
       <div class="feedback-modal" @click.stop>
         <div class="feedback-modal-header">
-          <h2>💬 意见反馈</h2>
+          <h2>意见反馈</h2>
           <button class="close-btn" @click="showFeedback = false">×</button>
         </div>
         <div class="feedback-modal-content">
@@ -278,8 +279,8 @@
 import { ref, computed } from 'vue'
 import axios from 'axios'
 
-    //const API_BASE = '/api'
-  const API_BASE = '/rest/api'
+const API_BASE = '/api'
+//const API_BASE = '/rest/api'
 const query = ref('')
 const searching = ref(false)
 const searchAnswer = ref('')
@@ -493,28 +494,68 @@ async function handleFeedbackSubmit() {
   position: relative;
 }
 
-.help-btn {
+.action-buttons {
   position: absolute;
   top: 24px;
   right: 24px;
   display: flex;
+  flex-direction: column;
+  gap: 8px;
   align-items: center;
+}
+
+.help-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
   gap: 6px;
   padding: 8px 16px;
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: white;
-  border: none;
+  min-width: 100px;
+  background: #f1f5f9;
+  color: #1e293b;
+  border: 1px solid #e2e8f0;
   border-radius: 20px;
   cursor: pointer;
   font-size: 14px;
   font-weight: 500;
   transition: all 0.3s;
-  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+  white-space: nowrap;
 }
 
 .help-btn:hover {
+  background: #e2e8f0;
   transform: translateY(-2px);
-  box-shadow: 0 6px 16px rgba(102, 126, 234, 0.4);
+}
+
+.feedback-btn-top {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 16px;
+  min-width: 100px;
+  background: #f1f5f9;
+  color: #1e293b;
+  border: 1px solid #e2e8f0;
+  border-radius: 20px;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 500;
+  transition: all 0.3s;
+  white-space: nowrap;
+}
+
+.feedback-btn-top:hover {
+  background: #e2e8f0;
+  transform: translateY(-2px);
+}
+
+.feedback-icon {
+  font-size: 16px;
+}
+
+.feedback-text {
+  font-size: 14px;
 }
 
 .help-icon {
@@ -848,15 +889,58 @@ async function handleFeedbackSubmit() {
     min-width: auto;
     padding: 14px 20px;
     font-size: 15px;
+    /* 帮助文档按钮的背景色 */
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
+    box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3) !important;
+  }
+
+  .search-btn:hover:not(:disabled) {
+    box-shadow: 0 6px 16px rgba(102, 126, 234, 0.4) !important;
+  }
+
+  .action-buttons {
+    top: 16px;
+    right: 16px;
+    gap: 6px;
   }
 
   .help-btn {
-    position: static;
-    margin-top: 12px;
-    width: 100%;
-    justify-content: center;
-    padding: 10px 16px;
-    font-size: 13px;
+    width: auto;
+    margin-top: 0;
+    padding: 8px 16px;
+    font-size: 14px;
+    background: #f1f5f9;
+    color: #1e293b;
+    border: 1px solid #e2e8f0;
+  }
+
+  .help-btn:hover {
+    background: #e2e8f0;
+  }
+
+  .feedback-btn-top {
+    width: auto;
+    padding: 8px 16px;
+    font-size: 14px;
+    background: #f1f5f9;
+    color: #1e293b;
+    border: 1px solid #e2e8f0;
+  }
+
+  .feedback-btn-top:hover {
+    background: #e2e8f0;
+  }
+
+  .feedback-icon {
+    font-size: 14px;
+  }
+
+  .feedback-text {
+    font-size: 14px;
+  }
+
+  .help-text {
+    font-size: 14px;
   }
 
   .ai-answer {
@@ -949,7 +1033,7 @@ async function handleFeedbackSubmit() {
   }
 }
 
-/* 使用文档弹窗样式 */
+/* 帮助文档弹窗样式 */
 .help-modal-overlay {
   position: fixed;
   top: 0;

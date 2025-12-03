@@ -2,7 +2,7 @@
   <div class="layout">
     <header class="top">
       <nav>
-        <RouterLink to="/" class="nav-btn ghost">AI 搜索 · 问答</RouterLink>
+        <RouterLink to="/" class="nav-btn ghost hide-mobile">AI 搜索 · 问答</RouterLink>
         <!-- 只有管理员才显示"知识入库"入口 -->
         <RouterLink v-if="isAdmin" to="/import" class="nav-btn">知识入库</RouterLink>
 
@@ -10,7 +10,7 @@
         <button
           v-if="!isAdmin"
           type="button"
-          class="nav-btn ghost"
+          class="nav-btn ghost hide-mobile"
           @click="handleAdminLogin"
         >
           管理员登录
@@ -18,7 +18,7 @@
         <button
           v-else
           type="button"
-          class="nav-btn ghost"
+          class="nav-btn ghost hide-mobile"
           @click="handleLogout"
         >
           退出管理员
@@ -39,8 +39,8 @@ import axios from 'axios'
 
 const router = useRouter()
 const isAdmin = ref(false)
- //const API_BASE = '/api'
-const API_BASE = '/rest/api'
+const API_BASE = '/api'
+//const API_BASE = '/rest/api'
 
 onMounted(() => {
   // 检查本地存储的管理员token
@@ -166,6 +166,11 @@ nav {
     font-size: 14px;
     text-align: center;
     justify-content: center;
+  }
+
+  /* 移动端隐藏 AI 搜索问答和管理员登录 */
+  .hide-mobile {
+    display: none !important;
   }
 
   .content {
