@@ -4,7 +4,7 @@
       <div>
         <p class="tag">自然资源和规划行业</p>
         <h1>AI 知识 · 问答</h1>
-        <p class="sub">输入问题，基于知识库即时检索答案。</p>
+        <p class="sub">基于行业知识库即时检索生成答案。</p>
       </div>
       <div class="action-buttons">
         <button class="help-btn" @click="showHelp = true" title="查看帮助文档">
@@ -20,7 +20,7 @@
         <input
           type="text"
           v-model="query"
-          placeholder="输入问题，如：临时用地使用期限最长能多久？"
+          placeholder="输入问题 如：临时用地的期限是多久？"
           class="search-input"
         />
         <button type="submit" :disabled="!query.trim() || searching" class="search-btn">
@@ -124,7 +124,12 @@
         <div class="help-modal-content">
           <section class="help-section">
             <h3>🎯 功能介绍</h3>
-            <p>AI知识问答系统基于RAG（检索增强生成）技术，能够从知识库中检索相关信息并生成精准答案。</p>
+            <ol>
+              <li>本AI知识库包含自然资源和规划、住建、发展改革、林业、水利、生态环境等领域的法律、法规、规章、规范性文件等文件近千份，
+                暂时未包含国家、行业及地方标准规范，后续会陆续更新最新政策文件及标准规范，保证知识库的全面性、时效性。</li>
+              <li>AI知识问答系统基于RAG（检索增强生成）技术，能够从知识库中检索相关信息并生成精准答案。
+                与通用AI问答助手相比，本AI知识问答系统优点在于聚焦行业政策，可辅助规划设计人员高效开展规划编制、政策研究、项目咨询等专业工作。</li>
+            </ol>
           </section>
 
           <section class="help-section">
@@ -132,9 +137,9 @@
             <ol>
               <li><strong>输入问题</strong>：在搜索框中输入您的问题，例如：
                 <ul>
-                  <li>"申报历史文化名村需要哪些材料？"</li>
-                  <li>"规划审批流程是什么？"</li>
-                  <li>"土地征收补偿标准是多少？"</li>
+                  <li>"城市更新项目有哪些用地政策？"</li>
+                  <li>"土地出让后，如何调整规划条件？"</li>
+                  <li>"什么叫多测合一？"</li>
                 </ul>
               </li>
               <li><strong>点击搜索</strong>：点击"AI 搜索"按钮，系统会自动检索知识库</li>
@@ -143,15 +148,15 @@
             </ol>
           </section>
 
-          <section class="help-section">
+          <!-- <section class="help-section">
             <h3>📚 文档分组</h3>
             <p>检索结果会按照文档来源自动分组显示：</p>
             <ul>
               <li><strong>📄 文件文档</strong>：来自上传的PDF、Word、TXT等文件</li>
-              <!-- <li><strong>🌐 网页文档</strong>：来自网页URL的内容</li> -->
+              <li><strong>🌐 网页文档</strong>：来自网页URL的内容</li>
             </ul>
-            <!-- <p>每个文档分组下会显示所有相关的文本片段，方便您查看完整的上下文信息。</p> -->
-          </section>
+            <p>每个文档分组下会显示所有相关的文本片段，方便您查看完整的上下文信息。</p>
+          </section> -->
 
           <section class="help-section">
             <h3>✨ 功能特点</h3>
@@ -159,7 +164,7 @@
               <li><strong>智能检索</strong>：基于向量相似度的语义搜索，理解问题意图</li>
               <li><strong>精准答案</strong>：AI基于知识库内容生成答案，确保准确性</li>
               <li><strong>来源标注</strong>：答案中的每个引用都有标注，可快速定位来源</li>
-              <li><strong>文档分组</strong>：按文档类型分组展示，结构清晰</li>
+              <!-- <li><strong>文档分组</strong>：按文档类型分组展示，结构清晰</li> -->
               <li><strong>快速跳转</strong>：点击标注即可跳转到对应文档片段</li>
             </ul>
           </section>
@@ -189,9 +194,13 @@
               <p>A: 需要管理员权限。请访问"知识库管理"页面，使用管理员token登录后即可上传文档。</p>
             </div>
              <div class="faq-item">
-              <strong>Q: 如何下载原件？</strong>
-              <p>A: 原件都属于重要的机密文件，如有需要可以联系管理员获取。 </p>
+              <strong>Q: 如何下载知识库中的政策文件？</strong>
+              <p>A: 由于部分政策文件涉密、涉敏，本系统暂不支持文件下载，如有需要，请联系管理员。 </p>
             </div>
+             <div class="feedback-info">
+              <p>意见反馈</p>
+              <p>本系统为V1.0版，如有不完善的地方，还请多多包涵!请大家通过[意见反馈]对话框提出宝贵意见和建议，不胜感激！</p>
+             </div>
             
           </section>
         </div>
@@ -496,27 +505,30 @@ async function handleFeedbackSubmit() {
 
 .action-buttons {
   position: absolute;
-  top: 24px;
+  top: 0;
   right: 24px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  align-items: center;
+  width: auto;
+  height: 100%;
 }
 
 .help-btn {
+  position: absolute;
+  top: 24px;
+  right: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  padding: 8px 16px;
-  min-width: 100px;
+  gap: 3px;
+  padding: 0 8px;
+  min-width: 75px;
+  height: auto;
   background: #f1f5f9;
   color: #1e293b;
   border: 1px solid #e2e8f0;
-  border-radius: 20px;
+  border-radius: 10px;
   cursor: pointer;
-  font-size: 14px;
+  font-size: 12px;
+  line-height: 1.2;
   font-weight: 500;
   transition: all 0.3s;
   white-space: nowrap;
@@ -528,18 +540,23 @@ async function handleFeedbackSubmit() {
 }
 
 .feedback-btn-top {
+  position: absolute;
+  bottom: 24px;
+  right: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  padding: 8px 16px;
-  min-width: 100px;
-  background: #f1f5f9;
+  gap: 3px;
+  padding: 0 8px;
+  min-width: 75px;
+  height: auto;
+  background: #f0f4f7;
   color: #1e293b;
   border: 1px solid #e2e8f0;
-  border-radius: 20px;
+  border-radius: 10px;
   cursor: pointer;
-  font-size: 14px;
+  font-size: 12px;
+  line-height: 1.2;
   font-weight: 500;
   transition: all 0.3s;
   white-space: nowrap;
@@ -555,7 +572,7 @@ async function handleFeedbackSubmit() {
 }
 
 .feedback-text {
-  font-size: 14px;
+  font-size: 12px;
 }
 
 .help-icon {
@@ -563,7 +580,7 @@ async function handleFeedbackSubmit() {
 }
 
 .help-text {
-  font-size: 14px;
+  font-size: 12px;
 }
 
 .tag {
@@ -899,19 +916,24 @@ async function handleFeedbackSubmit() {
   }
 
   .action-buttons {
-    top: 16px;
+    top: 0;
     right: 16px;
-    gap: 6px;
+    height: 100%;
   }
 
   .help-btn {
-    width: auto;
-    margin-top: 0;
-    padding: 8px 16px;
-    font-size: 14px;
+    top: 16px;
+    padding: 0 8px;
+    min-width: 75px;
+    height: auto;
+    font-size: 12px;
+    line-height: 1.2;
+    align-items: center;
+    justify-content: center;
     background: #f1f5f9;
     color: #1e293b;
     border: 1px solid #e2e8f0;
+    border-radius: 10px;
   }
 
   .help-btn:hover {
@@ -919,12 +941,18 @@ async function handleFeedbackSubmit() {
   }
 
   .feedback-btn-top {
-    width: auto;
-    padding: 8px 16px;
-    font-size: 14px;
-    background: #f1f5f9;
+    bottom: 5px;
+    padding: 0 8px;
+    min-width: 75px;
+    height: auto;
+    font-size: 12px;
+    line-height: 1.2;
+    align-items: center;
+    justify-content: center;
+    background: #f0f4f7;
     color: #1e293b;
     border: 1px solid #e2e8f0;
+    border-radius: 10px;
   }
 
   .feedback-btn-top:hover {
@@ -932,15 +960,15 @@ async function handleFeedbackSubmit() {
   }
 
   .feedback-icon {
-    font-size: 14px;
+    font-size: 11px;
   }
 
   .feedback-text {
-    font-size: 14px;
+    font-size: 12px;
   }
 
   .help-text {
-    font-size: 14px;
+    font-size: 12px;
   }
 
   .ai-answer {
@@ -1148,12 +1176,24 @@ async function handleFeedbackSubmit() {
   margin: 8px 0;
 }
 
+
+/* 意见反馈部分的段落缩进 */
+.help-section .feedback-info p {
+  text-indent: 2em;
+}
+
+/* 意见反馈标题不缩进 */
+.help-section .feedback-info p:first-child {
+  text-indent: 0;
+}
+
 .help-section ul,
 .help-section ol {
   color: #475569;
   line-height: 1.8;
   margin: 12px 0;
   padding-left: 24px;
+  list-style-position: outside;
 }
 
 .help-section li {

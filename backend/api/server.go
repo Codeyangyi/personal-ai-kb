@@ -40,16 +40,16 @@ type FileInfo struct {
 
 // Server HTTP API服务器
 type Server struct {
-	ragSystem     *rag.RAG
-	config        *config.Config
-	embedder      *embedding.Embedder
-	store         *store.QdrantStore
-	llm           llm.LLM
-	adminToken    string
-	filesDir      string
-	failedFilesDir string // 失败文件目录
-	files         map[string]*FileInfo // 文件ID -> 文件信息
-	db            *sql.DB              // MySQL 连接（用于业务数据，如意见反馈）
+	ragSystem      *rag.RAG
+	config         *config.Config
+	embedder       *embedding.Embedder
+	store          *store.QdrantStore
+	llm            llm.LLM
+	adminToken     string
+	filesDir       string
+	failedFilesDir string               // 失败文件目录
+	files          map[string]*FileInfo // 文件ID -> 文件信息
+	db             *sql.DB              // MySQL 连接（用于业务数据，如意见反馈）
 }
 
 // NewServer 创建新的API服务器
@@ -131,7 +131,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	// 获取管理员token（从环境变量或配置）
 	adminToken := os.Getenv("ADMIN_TOKEN")
 	if adminToken == "" {
-		adminToken = "admin123" // 默认token，生产环境应该使用强密码
+		adminToken = "Zhzx@666" // 默认token，生产环境应该使用强密码
 		log.Println("警告: 使用默认管理员token，建议设置 ADMIN_TOKEN 环境变量")
 	}
 
@@ -368,14 +368,14 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		} else if strings.Contains(errMsg, "too large") {
 			userFriendlyMsg = "PDF文件过大（最大500MB）"
 		}
-		
+
 		// 保存失败文件到失败目录
 		failureReason := fmt.Sprintf("加载文档失败: %s", userFriendlyMsg)
 		if saveErr := s.saveFailedFile(savedPath, header.Filename, failureReason); saveErr != nil {
 			log.Printf("保存失败文件时出错: %v", saveErr)
 			os.Remove(savedPath) // 如果保存失败，删除原文件
 		}
-		
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success":  false,
@@ -584,14 +584,14 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 			} else if strings.Contains(errMsg, "too large") {
 				userFriendlyMsg = "PDF文件过大（最大100MB）"
 			}
-			
+
 			// 保存失败文件到失败目录
 			failureReason := fmt.Sprintf("加载文档失败: %s", userFriendlyMsg)
 			if saveErr := s.saveFailedFile(savedPath, fileHeader.Filename, failureReason); saveErr != nil {
 				log.Printf("保存失败文件时出错: %v", saveErr)
 				os.Remove(savedPath) // 如果保存失败，删除原文件
 			}
-			
+
 			results = append(results, FileResult{
 				Filename: fileHeader.Filename,
 				Success:  false,
@@ -668,7 +668,7 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 		if err := s.ragSystem.AddDocuments(ctx, allChunks); err != nil {
 			log.Printf("向量化失败: %v", err)
 			vectorizationError = err
-			
+
 			// 向量化失败时，将所有成功处理的文件移动到失败目录
 			failureReason := fmt.Sprintf("向量化失败: %v", err)
 			for i := range results {
@@ -681,7 +681,7 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 						cleanedFilename = strings.ReplaceAll(cleanedFilename, "\\", "_")
 						cleanedFilename = strings.ReplaceAll(cleanedFilename, "..", "_")
 						filePath := filepath.Join(s.filesDir, result.FileID+"_"+cleanedFilename)
-						
+
 						// 保存失败文件
 						if saveErr := s.saveFailedFile(filePath, fileInfo.Filename, failureReason); saveErr != nil {
 							log.Printf("保存失败文件时出错: %v", saveErr)
@@ -1292,12 +1292,12 @@ func (s *Server) saveFailedFile(filePath, originalFilename, reason string) error
 
 	ext := filepath.Ext(originalFilename)
 	nameWithoutExt := strings.TrimSuffix(originalFilename, ext)
-	
+
 	// 清理文件名中的危险字符
 	cleanedName := strings.ReplaceAll(nameWithoutExt, "/", "_")
 	cleanedName = strings.ReplaceAll(cleanedName, "\\", "_")
 	cleanedName = strings.ReplaceAll(cleanedName, "..", "_")
-	
+
 	// 使用原文件名（清理危险字符后）
 	failedFilename := cleanedName + ext
 	failedPath := filepath.Join(s.failedFilesDir, failedFilename)

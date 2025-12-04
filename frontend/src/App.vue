@@ -67,7 +67,7 @@ async function checkAdmin(token) {
 }
 
 function handleAdminLogin() {
-  const token = prompt('请输入管理员token（仅限内部人员）：')
+  const token = prompt('请输入管理员密码:')
   if (!token) return
   checkAdmin(token).then(() => {
     if (isAdmin.value) {
