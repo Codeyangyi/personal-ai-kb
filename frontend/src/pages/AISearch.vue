@@ -4,7 +4,8 @@
       <div>
         <p class="tag">自然资源和规划行业</p>
         <h1>AI 知识 · 问答</h1>
-        <p class="sub">基于行业知识库即时检索生成答案。</p>
+        <!-- <p class="sub">基于行业知识库即时检索生成答案。</p> -->
+        <p class="sub">知识库已收录政策文件{{ fileCount }}份</p>
       </div>
       <div class="action-buttons">
         <button class="help-btn" @click="showHelp = true" title="查看帮助文档">
@@ -285,7 +286,7 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import axios from 'axios'
 
 const API_BASE = '/api'
@@ -299,6 +300,7 @@ const searchError = ref('')
 const showHelp = ref(false)
 const showFeedback = ref(false)
 const submittingFeedback = ref(false)
+const fileCount = ref(0)
 
 // 反馈表单数据
 const feedbackForm = ref({
@@ -312,6 +314,26 @@ const feedbackForm = ref({
 // 计算总片段数
 const totalChunks = computed(() => {
   return docGroups.value.reduce((sum, group) => sum + group.chunks.length, 0)
+})
+
+// 获取文件数量
+async function fetchFileCount() {
+  try {
+    const response = await axios.get(`${API_BASE}/files/count`)
+    if (response.data.success) {
+      fileCount.value = response.data.count || 0
+    }
+  } catch (error) {
+    console.error('获取文件数量失败:', error)
+    // 如果获取失败，保持默认值0或显示错误提示
+  }
+}
+
+// 组件挂载时获取文件数量
+onMounted(() => {
+  fetchFileCount()
+  // 每30秒刷新一次文件数量
+  setInterval(fetchFileCount, 30000)
 })
 
 async function handleSearch() {

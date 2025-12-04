@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -170,6 +171,25 @@ func NewServer(cfg *config.Config) (*Server, error) {
 func (s *Server) Start(port string) error {
 	mux := http.NewServeMux()
 
+	// Panic恢复中间件
+	recoveryMiddleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer func() {
+				if err := recover(); err != nil {
+					log.Printf("请求处理发生panic: %v, 请求路径: %s, 方法: %s, 堆栈: %s", 
+						err, r.URL.Path, r.Method, getStackTrace())
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusInternalServerError)
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"error":   "服务器内部错误",
+						"message": "请求处理时发生意外错误，请稍后重试",
+					})
+				}
+			}()
+			next.ServeHTTP(w, r)
+		})
+	}
+
 	// CORS中间件
 	corsMiddleware := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -193,6 +213,7 @@ func (s *Server) Start(port string) error {
 	mux.HandleFunc("/api/query", s.handleQuery)
 	mux.HandleFunc("/api/feedback", s.handleFeedback)
 	mux.HandleFunc("/api/check-admin", s.handleCheckAdmin)
+	mux.HandleFunc("/api/files/count", s.handleFileCount)
 	mux.HandleFunc("/api/files", s.handleFileList)
 	mux.HandleFunc("/api/files/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "GET" {
@@ -234,7 +255,8 @@ func (s *Server) Start(port string) error {
 		})
 	}
 
-	handler := corsMiddleware(mux)
+	// 先应用panic恢复，再应用CORS
+	handler := recoveryMiddleware(corsMiddleware(mux))
 
 	// 创建HTTP服务器并设置超时时间
 	// 优化：增加超时时间以支持大文件上传和长时间向量化
@@ -1057,6 +1079,31 @@ func (s *Server) handleFileList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleFileCount 获取文件数量（无需管理员权限，公开接口）
+func (s *Server) handleFileCount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 重新从磁盘加载文件列表（确保数据最新）
+	s.loadFilesFromDisk()
+
+	// 过滤系统文件
+	var count int
+	for _, file := range s.files {
+		if !isSystemFile(file.Filename) {
+			count++
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"count":   count,
+	})
+}
+
 // handleFileDownload 下载文件
 func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
@@ -1367,4 +1414,11 @@ func (s *Server) checkAdminAuth(r *http.Request) bool {
 	// 从Query参数获取token
 	token = r.URL.Query().Get("token")
 	return token == s.adminToken
+}
+
+// getStackTrace 获取当前goroutine的堆栈跟踪信息
+func getStackTrace() string {
+	buf := make([]byte, 4096)
+	n := runtime.Stack(buf, false)
+	return string(buf[:n])
 }
