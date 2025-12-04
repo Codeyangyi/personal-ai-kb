@@ -131,7 +131,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	// 获取管理员token（从环境变量或配置）
 	adminToken := os.Getenv("ADMIN_TOKEN")
 	if adminToken == "" {
-		adminToken = "Zhzx@666" // 默认token，生产环境应该使用强密码
+		adminToken = "admin123" // 默认token，生产环境应该使用强密码
 		log.Println("警告: 使用默认管理员token，建议设置 ADMIN_TOKEN 环境变量")
 	}
 
@@ -359,8 +359,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		userFriendlyMsg := errMsg
 		if strings.Contains(errMsg, "加密") || strings.Contains(errMsg, "password") {
 			userFriendlyMsg = "PDF文件已加密或受密码保护，请先移除密码保护"
-		} else if strings.Contains(errMsg, "损坏") || strings.Contains(errMsg, "corrupt") {
-			userFriendlyMsg = "PDF文件可能已损坏，请尝试重新保存文件"
+		} else if strings.Contains(errMsg, "损坏") || strings.Contains(errMsg, "corrupt") || strings.Contains(errMsg, "格式异常") || strings.Contains(errMsg, "malformed") {
+			userFriendlyMsg = "PDF文件可能已损坏或格式不正确，请尝试用PDF阅读器打开并重新保存"
+		} else if strings.Contains(errMsg, "stream") || strings.Contains(errMsg, "结构不完整") {
+			userFriendlyMsg = "PDF文件格式异常，可能是扫描版PDF（图片格式）或文件结构不完整。请尝试用PDF阅读器打开并重新保存，或使用OCR工具提取文本"
 		} else if strings.Contains(errMsg, "扫描版") || strings.Contains(errMsg, "OCR") {
 			userFriendlyMsg = "扫描版PDF（纯图片），无法提取文本，请使用OCR工具提取文本"
 		} else if strings.Contains(errMsg, "empty") {
@@ -575,8 +577,10 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 			userFriendlyMsg := errMsg
 			if strings.Contains(errMsg, "加密") || strings.Contains(errMsg, "password") {
 				userFriendlyMsg = "PDF文件已加密或受密码保护，请先移除密码保护"
-			} else if strings.Contains(errMsg, "损坏") || strings.Contains(errMsg, "corrupt") {
-				userFriendlyMsg = "PDF文件可能已损坏，请尝试重新保存文件"
+			} else if strings.Contains(errMsg, "损坏") || strings.Contains(errMsg, "corrupt") || strings.Contains(errMsg, "格式异常") || strings.Contains(errMsg, "malformed") {
+				userFriendlyMsg = "PDF文件可能已损坏或格式不正确，请尝试用PDF阅读器打开并重新保存"
+			} else if strings.Contains(errMsg, "stream") || strings.Contains(errMsg, "结构不完整") {
+				userFriendlyMsg = "PDF文件格式异常，可能是扫描版PDF（图片格式）或文件结构不完整。请尝试用PDF阅读器打开并重新保存，或使用OCR工具提取文本"
 			} else if strings.Contains(errMsg, "扫描版") || strings.Contains(errMsg, "OCR") {
 				userFriendlyMsg = "扫描版PDF（纯图片），无法提取文本，请使用OCR工具提取文本"
 			} else if strings.Contains(errMsg, "empty") {

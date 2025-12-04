@@ -143,8 +143,11 @@ func (l *FileLoader) Load(path string) ([]schema.Document, error) {
 			if strings.Contains(errMsg, "encrypted") || strings.Contains(errMsg, "password") {
 				return nil, fmt.Errorf("PDF文件已加密或受密码保护，无法读取。请先移除密码保护后再上传: %w", err)
 			}
-			if strings.Contains(errMsg, "corrupt") || strings.Contains(errMsg, "invalid") {
+			if strings.Contains(errMsg, "corrupt") || strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "malformed") {
 				return nil, fmt.Errorf("PDF文件可能已损坏或格式不正确。请尝试用PDF阅读器打开并重新保存: %w", err)
+			}
+			if strings.Contains(errMsg, "stream not present") || strings.Contains(errMsg, "stream") {
+				return nil, fmt.Errorf("PDF文件格式异常，可能是扫描版PDF（图片格式）或文件结构不完整。请尝试用PDF阅读器打开并重新保存，或使用OCR工具提取文本: %w", err)
 			}
 			if strings.Contains(errMsg, "EOF") || strings.Contains(errMsg, "unexpected") {
 				return nil, fmt.Errorf("PDF文件解析失败，可能是扫描版PDF（图片格式）或格式不标准。请尝试使用OCR工具提取文本: %w", err)
