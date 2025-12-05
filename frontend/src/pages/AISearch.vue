@@ -40,7 +40,7 @@
         </div>
 
         <!-- 相关文档 - 按文档类型分组 -->
-        <div v-if="docGroups.length > 0 || searchResults.length > 0" class="related-docs">
+        <div v-if="shouldShowRelatedDocs" class="related-docs">
           <div class="results-header">
             <p v-if="docGroups.length > 0">
               找到 {{ docGroups.length }} 个相关文档，共 {{ totalChunks }} 个相关片段
@@ -62,7 +62,17 @@
                   <span class="doc-icon">{{ group.sourceType === 'url' ? '🌐' : '📄' }}</span>
                   {{ group.docTitle || '未命名文档' }}
                 </h3>
-                <span class="doc-group-count">{{ group.chunks.length }} 个相关片段</span>
+                <div class="doc-group-actions">
+                  <span class="doc-group-count">{{ group.chunks.length }} 个相关片段</span>
+                  <button
+                    v-if="group.sourceType === 'file' && group.fileId"
+                    @click="downloadFile(group.fileId, group.docTitle, group)"
+                    class="download-btn"
+                    title="下载文档"
+                  >
+                    📥 下载
+                  </button>
+                </div>
               </div>
               <div class="doc-group-chunks">
                 <article
@@ -283,6 +293,15 @@
       </div>
     </div>
   </div>
+
+  <!-- 自定义提示框 -->
+  <div v-if="showMessage" class="message-overlay" @click="closeMessage">
+    <div class="message-modal" @click.stop>
+      <div class="message-icon">🔒</div>
+      <div class="message-content">{{ messageText }}</div>
+      <button class="message-btn" @click="closeMessage">确定</button>
+    </div>
+  </div>
 </template>
 
 <script setup>
@@ -301,6 +320,8 @@ const showHelp = ref(false)
 const showFeedback = ref(false)
 const submittingFeedback = ref(false)
 const fileCount = ref(0)
+const showMessage = ref(false)
+const messageText = ref('')
 
 // 反馈表单数据
 const feedbackForm = ref({
@@ -314,6 +335,24 @@ const feedbackForm = ref({
 // 计算总片段数
 const totalChunks = computed(() => {
   return docGroups.value.reduce((sum, group) => sum + group.chunks.length, 0)
+})
+
+// 判断答案是否表示无法找到信息
+const hasNoAnswer = computed(() => {
+  if (!searchAnswer.value) return false
+  const answerText = searchAnswer.value.toLowerCase()
+  return answerText.includes('根据提供的上下文，我无法找到相关信息') ||
+         answerText.includes('无法找到相关信息') ||
+         answerText.includes('没有找到相关信息') ||
+         answerText.includes('抱歉，我在知识库中没有找到相关信息')
+})
+
+// 判断是否应该显示相关文档和片段
+const shouldShowRelatedDocs = computed(() => {
+  // 如果答案表示无法找到信息，不显示相关文档和片段
+  if (hasNoAnswer.value) return false
+  // 否则根据是否有文档和片段来决定
+  return docGroups.value.length > 0 || searchResults.value.length > 0
 })
 
 // 获取文件数量
@@ -358,6 +397,15 @@ async function handleSearch() {
     // 优先使用按文档分组的格式（新格式）
     if (response.data.docGroups && response.data.docGroups.length > 0) {
       docGroups.value = response.data.docGroups
+      // 调试：打印文档信息，特别是hasPublicForm字段
+      console.log('接收到的文档组:', docGroups.value.map(g => ({
+        docTitle: g.docTitle,
+        fileType: g.fileType,
+        hasPublicForm: g.hasPublicForm,
+        hasPublicFormType: typeof g.hasPublicForm,
+        fileId: g.fileId,
+        sourceType: g.sourceType
+      })))
     } else if (response.data.results) {
       // 兼容旧格式：如果没有docGroups，使用平铺格式
       searchResults.value = response.data.results
@@ -373,15 +421,33 @@ async function handleSearch() {
 }
 
 function formatAnswer(text) {
-  // 格式化答案，将换行转换为<br>，并为标注添加点击样式
+  if (!text) return ''
+  
+  // 检查答案是否表示无法找到信息
+  const answerText = text.toLowerCase()
+  const isNoAnswer = answerText.includes('根据提供的上下文，我无法找到相关信息') ||
+                     answerText.includes('无法找到相关信息') ||
+                     answerText.includes('没有找到相关信息') ||
+                     answerText.includes('抱歉，我在知识库中没有找到相关信息')
+  
+  // 格式化答案，将换行转换为<br>
   let formatted = text.replace(/\n/g, '<br>')
   
-  // 为标注（①、②、③等）添加可点击样式和data属性
-  const circleNumbers = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩']
-  circleNumbers.forEach((num, index) => {
-    const regex = new RegExp(num, 'g')
-    formatted = formatted.replace(regex, `<span class="annotation" data-index="${index + 1}" title="点击跳转到文档片段 ${index + 1}">${num}</span>`)
-  })
+  // 如果答案表示无法找到信息，移除所有序号标注
+  if (isNoAnswer) {
+    const circleNumbers = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩']
+    circleNumbers.forEach((num) => {
+      const regex = new RegExp(num, 'g')
+      formatted = formatted.replace(regex, '')
+    })
+  } else {
+    // 为标注（①、②、③等）添加可点击样式和data属性
+    const circleNumbers = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩']
+    circleNumbers.forEach((num, index) => {
+      const regex = new RegExp(num, 'g')
+      formatted = formatted.replace(regex, `<span class="annotation" data-index="${index + 1}" title="点击跳转到文档片段 ${index + 1}">${num}</span>`)
+    })
+  }
   
   return formatted
 }
@@ -457,6 +523,116 @@ function closeFeedback() {
       image: null,
       imagePreview: null
     }
+  }, 300)
+}
+
+// 判断是否可以下载
+function canDownload(group) {
+  if (!group) {
+    return false
+  }
+  
+  // 如果不是文件类型，不允许下载
+  if (group.sourceType !== 'file' || !group.fileId) {
+    return false
+  }
+  
+  // 对于pdf、word、txt文档，检查是否包含"公开形式"字眼
+  if (group.fileType) {
+    const fileTypeLower = group.fileType.toLowerCase()
+    if (fileTypeLower === 'pdf' || fileTypeLower === 'doc' || fileTypeLower === 'docx' || fileTypeLower === 'txt') {
+      // 检查 hasPublicForm 字段（可能是 true、'true'、1 或 undefined）
+      const hasPublicForm = group.hasPublicForm === true || group.hasPublicForm === 'true' || group.hasPublicForm === 1
+      
+      // 如果包含"公开形式"字眼，不允许下载
+      if (hasPublicForm) {
+        console.log('检测到文档包含"公开形式"，禁止下载:', {
+          docTitle: group.docTitle,
+          fileType: group.fileType,
+          hasPublicForm: group.hasPublicForm
+        })
+        return false
+      }
+      // 如果没有"公开形式"字眼，允许下载
+      return true
+    }
+  }
+  
+  // 其他文档类型（非pdf/word/txt）不做限制，允许下载
+  return true
+}
+
+// 下载文件
+function downloadFile(fileId, filename, group) {
+  console.log('下载文件:', { fileId, filename, group })
+  
+  if (!fileId) {
+    showMessageDialog('文件ID不存在，无法下载')
+    return
+  }
+  
+  // 检查是否可以下载
+  if (group) {
+    // 对于PDF、Word、TXT文档，直接检查hasPublicForm字段
+    if (group.fileType) {
+      const fileTypeLower = group.fileType.toLowerCase()
+      if (fileTypeLower === 'pdf' || fileTypeLower === 'doc' || fileTypeLower === 'docx' || fileTypeLower === 'txt') {
+        // 检查 hasPublicForm 字段（可能是 true、'true'、1 或 undefined）
+        const hasPublicForm = group.hasPublicForm === true || group.hasPublicForm === 'true' || group.hasPublicForm === 1
+        
+        console.log('检查下载权限（直接检查）:', {
+          docTitle: group.docTitle,
+          sourceType: group.sourceType,
+          fileId: group.fileId,
+          fileType: group.fileType,
+          hasPublicForm: group.hasPublicForm,
+          hasPublicFormType: typeof group.hasPublicForm,
+          hasPublicFormResult: hasPublicForm
+        })
+        
+        if (hasPublicForm) {
+          showMessageDialog('此文件涉密文件 不提供下载服务')
+          return
+        }
+      }
+    }
+    
+    // 再次使用canDownload函数检查（双重检查）
+    console.log('检查下载权限（canDownload函数）:', {
+      sourceType: group.sourceType,
+      fileId: group.fileId,
+      fileType: group.fileType,
+      hasPublicForm: group.hasPublicForm,
+      hasPublicFormType: typeof group.hasPublicForm,
+      canDownload: canDownload(group)
+    })
+    
+    if (!canDownload(group)) {
+      showMessageDialog('此文件涉密文件 不提供下载服务')
+      return
+    }
+  }
+  
+  const url = `${API_BASE}/files/${fileId}`
+  const link = document.createElement('a')
+  link.href = url
+  link.download = filename || 'document'
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+}
+
+// 显示提示框
+function showMessageDialog(text) {
+  messageText.value = text
+  showMessage.value = true
+}
+
+// 关闭提示框
+function closeMessage() {
+  showMessage.value = false
+  setTimeout(() => {
+    messageText.value = ''
   }, 300)
 }
 
@@ -540,16 +716,16 @@ async function handleFeedbackSubmit() {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 3px;
-  padding: 0 8px;
-  min-width: 75px;
-  height: auto;
+  gap: 4px;
+  padding: 8px 12px;
+  min-width: 85px;
+  height: 36px;
   background: #f1f5f9;
   color: #1e293b;
   border: 1px solid #e2e8f0;
   border-radius: 10px;
   cursor: pointer;
-  font-size: 12px;
+  font-size: 14px;
   line-height: 1.2;
   font-weight: 500;
   transition: all 0.3s;
@@ -558,7 +734,6 @@ async function handleFeedbackSubmit() {
 
 .help-btn:hover {
   background: #e2e8f0;
-  transform: translateY(-2px);
 }
 
 .feedback-btn-top {
@@ -568,16 +743,16 @@ async function handleFeedbackSubmit() {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 3px;
-  padding: 0 8px;
-  min-width: 75px;
-  height: auto;
+  gap: 4px;
+  padding: 8px 12px;
+  min-width: 85px;
+  height: 36px;
   background: #f0f4f7;
   color: #1e293b;
   border: 1px solid #e2e8f0;
   border-radius: 10px;
   cursor: pointer;
-  font-size: 12px;
+  font-size: 14px;
   line-height: 1.2;
   font-weight: 500;
   transition: all 0.3s;
@@ -586,23 +761,22 @@ async function handleFeedbackSubmit() {
 
 .feedback-btn-top:hover {
   background: #e2e8f0;
-  transform: translateY(-2px);
 }
 
 .feedback-icon {
-  font-size: 16px;
+  font-size: 14px;
 }
 
 .feedback-text {
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .help-icon {
-  font-size: 16px;
+  font-size: 14px;
 }
 
 .help-text {
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .tag {
@@ -836,6 +1010,12 @@ async function handleFeedbackSubmit() {
   font-size: 20px;
 }
 
+.doc-group-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
 .doc-group-count {
   font-size: 13px;
   color: #6366f1;
@@ -843,6 +1023,50 @@ async function handleFeedbackSubmit() {
   padding: 4px 12px;
   border-radius: 12px;
   font-weight: 500;
+}
+
+.download-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 8px 12px;
+  min-width: 85px;
+  height: 36px;
+  background: #f1f5f9;
+  color: #1e293b;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1.2;
+  font-weight: 500;
+  transition: all 0.3s;
+  white-space: nowrap;
+}
+
+.download-btn:hover {
+  background: #e2e8f0;
+}
+
+.download-restriction {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 8px 12px;
+  min-width: fit-content;
+  height: 36px;
+  background: #fee2e2;
+  color: #991b1b;
+  border: 1px solid #fca5a5;
+  border-radius: 10px;
+  font-size: 14px;
+  line-height: 1.2;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: help;
+  box-shadow: 0 2px 8px rgba(252, 165, 165, 0.3);
 }
 
 .doc-group-chunks {
@@ -1019,9 +1243,48 @@ async function handleFeedbackSubmit() {
     width: 100%;
   }
 
+  .doc-group-actions {
+    flex-wrap: wrap;
+    gap: 8px;
+    width: 100%;
+    justify-content: flex-end;
+  }
+
   .doc-group-count {
     font-size: 12px;
     padding: 3px 10px;
+  }
+
+  .download-btn {
+    padding: 0 8px;
+    min-width: 75px;
+    height: auto;
+    font-size: 12px;
+    line-height: 1.2;
+    align-items: center;
+    justify-content: center;
+    background: #f1f5f9;
+    color: #1e293b;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+  }
+
+  .download-btn:hover {
+    background: #e2e8f0;
+  }
+
+  .download-restriction {
+    padding: 0 8px;
+    min-width: 75px;
+    height: auto;
+    font-size: 12px;
+    line-height: 1.2;
+    align-items: center;
+    justify-content: center;
+    background: #fee2e2;
+    color: #991b1b;
+    border: 1px solid #fca5a5;
+    border-radius: 10px;
   }
 
   .doc-group-chunks {
@@ -1738,6 +2001,117 @@ async function handleFeedbackSubmit() {
   .form-group input,
   .form-group textarea {
     font-size: 16px; /* 防止iOS自动缩放 */
+  }
+}
+
+/* 自定义提示框样式 */
+.message-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10000;
+  padding: 20px;
+  animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.message-modal {
+  background: white;
+  border-radius: 16px;
+  padding: 32px 24px;
+  max-width: 400px;
+  width: 100%;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+  animation: slideUp 0.3s ease;
+  text-align: center;
+}
+
+@keyframes slideUp {
+  from {
+    transform: translateY(20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.message-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+}
+
+.message-content {
+  font-size: 16px;
+  color: #333;
+  line-height: 1.6;
+  margin-bottom: 24px;
+  word-wrap: break-word;
+}
+
+.message-btn {
+  width: 100%;
+  padding: 12px 24px;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 16px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s;
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+}
+
+.message-btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 6px 16px rgba(102, 126, 234, 0.4);
+}
+
+.message-btn:active {
+  transform: translateY(0);
+}
+
+/* 移动端适配 */
+@media (max-width: 768px) {
+  .message-overlay {
+    padding: 16px;
+  }
+
+  .message-modal {
+    padding: 24px 20px;
+    border-radius: 12px;
+    max-width: 100%;
+  }
+
+  .message-icon {
+    font-size: 40px;
+    margin-bottom: 12px;
+  }
+
+  .message-content {
+    font-size: 15px;
+    margin-bottom: 20px;
+  }
+
+  .message-btn {
+    padding: 14px 24px;
+    font-size: 15px;
   }
 }
 </style>

@@ -754,8 +754,14 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 
 // handleQuery 处理查询请求
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
+	// 提前设置响应头，确保即使发生错误也能正确返回
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	
 	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": "Method not allowed",
+		})
 		return
 	}
 
@@ -765,12 +771,21 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request", http.StatusBadRequest)
+		log.Printf("解析请求体失败: %v", err)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":   "Invalid request",
+			"message": "无法解析请求体",
+		})
 		return
 	}
 
 	if req.Question == "" {
-		http.Error(w, "Question is required", http.StatusBadRequest)
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":   "Question is required",
+			"message": "问题不能为空",
+		})
 		return
 	}
 
@@ -781,23 +796,24 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// 创建临时RAG实例用于查询（使用指定的topK）
 	tempRAG := rag.NewRAG(s.embedder, s.store, s.llm, req.TopK)
 
-	log.Printf("收到查询请求: %s (topK=%d)", req.Question, req.TopK)
+	log.Printf("收到查询请求: %s (topK=%d), 客户端: %s", req.Question, req.TopK, r.RemoteAddr)
 	ctx := context.Background()
 
 	// 使用 QueryWithResults 方法，避免重复搜索
 	queryResult, err := tempRAG.QueryWithResults(ctx, req.Question)
 	if err != nil {
-		log.Printf("查询失败 - 问题: %s, 错误: %v, 错误类型: %T", req.Question, err, err)
+		log.Printf("查询失败 - 问题: %s, 错误: %v, 错误类型: %T, 客户端: %s", req.Question, err, err, r.RemoteAddr)
 		// 返回更详细的错误信息
-		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		if encodeErr := json.NewEncoder(w).Encode(map[string]interface{}{
 			"error":   "查询失败",
 			"message": err.Error(),
-		})
+		}); encodeErr != nil {
+			log.Printf("编码错误响应失败: %v", encodeErr)
+		}
 		return
 	}
-	log.Printf("查询成功，答案长度: %d 字符", len(queryResult.Answer))
+	log.Printf("查询成功，答案长度: %d 字符, 结果数量: %d", len(queryResult.Answer), len(queryResult.Results))
 
 	// 分析答案中的标注，找出被使用的文档片段编号
 	usedIndices := extractUsedAnnotations(queryResult.Answer)
@@ -805,10 +821,13 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// 按文档来源分组，只返回被标注使用的文档片段
 	// 使用 map 来按文档来源分组
 	type DocGroup struct {
-		DocTitle   string                   `json:"docTitle"`
-		DocSource  string                   `json:"docSource"`
-		SourceType string                   `json:"sourceType"` // "file" 或 "url"
-		Chunks     []map[string]interface{} `json:"chunks"`
+		DocTitle      string                   `json:"docTitle"`
+		DocSource     string                   `json:"docSource"`
+		SourceType    string                   `json:"sourceType"` // "file" 或 "url"
+		FileType      string                   `json:"fileType,omitempty"`      // 文件类型，如 "pdf", "docx", "txt" 等
+		HasPublicForm bool                     `json:"hasPublicForm,omitempty"` // 是否包含"公开形式"字眼
+		FileID        string                   `json:"fileId,omitempty"`        // 文件ID，用于下载
+		Chunks        []map[string]interface{} `json:"chunks"`
 	}
 
 	docGroupsMap := make(map[string]*DocGroup)
@@ -826,7 +845,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		originalIndex := i + 1
 
 		// 获取文档来源信息
-		var docTitle, docSource, sourceType string
+		var docTitle, docSource, sourceType, fileType, fileID string
 		if source, ok := doc.Metadata["source"].(string); ok {
 			docSource = source
 			// 判断是文件还是URL
@@ -837,6 +856,16 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 				sourceType = "file"
 				// 从文件路径中提取原始文件名（去除UUID前缀）
 				docTitle = extractOriginalFilename(filepath.Base(source))
+				// 从文件路径中提取fileID（格式：{fileID}_{原文件名}）
+				baseName := filepath.Base(source)
+				if idx := strings.Index(baseName, "_"); idx > 0 {
+					fileID = baseName[:idx]
+				}
+				// 判断文件类型
+				ext := strings.ToLower(filepath.Ext(docTitle))
+				if ext != "" {
+					fileType = ext[1:] // 去掉点号
+				}
 			}
 		}
 		// 优先使用file_name元数据（如果存在且不包含UUID）
@@ -845,6 +874,15 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			originalFileName := extractOriginalFilename(fileName)
 			if originalFileName != "" {
 				docTitle = originalFileName
+			}
+			// 从file_name中提取fileID
+			if idx := strings.Index(fileName, "_"); idx > 0 {
+				fileID = fileName[:idx]
+			}
+			// 判断文件类型
+			ext := strings.ToLower(filepath.Ext(originalFileName))
+			if ext != "" {
+				fileType = ext[1:] // 去掉点号
 			}
 		}
 		if docTitle == "" {
@@ -882,24 +920,171 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 				DocTitle:   docTitle,
 				DocSource:  docSource,
 				SourceType: sourceType,
+				FileType:   fileType,
+				FileID:     fileID,
 				Chunks:     []map[string]interface{}{},
+			}
+		} else {
+			// 如果组已存在，更新文件类型和文件ID（如果当前文档片段有这些信息）
+			if fileType != "" && docGroupsMap[groupKey].FileType == "" {
+				docGroupsMap[groupKey].FileType = fileType
+			}
+			if fileID != "" && docGroupsMap[groupKey].FileID == "" {
+				docGroupsMap[groupKey].FileID = fileID
 			}
 		}
 		docGroupsMap[groupKey].Chunks = append(docGroupsMap[groupKey].Chunks, result)
 	}
 
-	// 将 map 转换为 slice
+	// 将 map 转换为 slice，并检查pdf、word、txt文档中是否包含"公开形式"字眼
 	docGroups := make([]DocGroup, 0, len(docGroupsMap))
 	for _, group := range docGroupsMap {
+		// 只对pdf、word、txt文档检查是否包含"公开形式：不予公开"或"公开形式：依申请公开"
+		fileTypeLower := strings.ToLower(group.FileType)
+		if fileTypeLower == "pdf" || fileTypeLower == "doc" || fileTypeLower == "docx" || fileTypeLower == "txt" {
+			// 先检查返回的chunks内容
+			allContent := ""
+			for _, chunk := range group.Chunks {
+				// 尝试多个可能的字段名
+				if content, ok := chunk["content"].(string); ok && content != "" {
+					allContent += content + "\n"
+				} else if content, ok := chunk["pageContent"].(string); ok && content != "" {
+					allContent += content + "\n"
+				} else if content, ok := chunk["preview"].(string); ok && content != "" {
+					allContent += content + "\n"
+				}
+			}
+			
+			log.Printf("检查文档 %s (类型: %s, FileID: %s) 是否包含'公开形式：不予公开'、'公开形式：依申请公开'或'公开形式：不公开'，chunks内容长度: %d", group.DocTitle, group.FileType, group.FileID, len(allContent))
+			
+			// 无论chunks中是否找到，都尝试重新加载整个文档来确保完整检查
+			if group.FileID != "" {
+				var filePath string
+				// 优先使用DocSource
+				if group.DocSource != "" && !strings.HasPrefix(group.DocSource, "http://") && !strings.HasPrefix(group.DocSource, "https://") {
+					if _, err := os.Stat(group.DocSource); err == nil {
+						filePath = group.DocSource
+					}
+				}
+				
+				// 如果DocSource不存在，尝试从FileID和DocTitle构建路径
+				if filePath == "" {
+					newFormatPath := filepath.Join(s.filesDir, group.FileID+"_"+group.DocTitle)
+					oldFormatPath := filepath.Join(s.filesDir, group.FileID+filepath.Ext(group.DocTitle))
+					if _, err := os.Stat(newFormatPath); err == nil {
+						filePath = newFormatPath
+					} else if _, err := os.Stat(oldFormatPath); err == nil {
+						filePath = oldFormatPath
+					}
+				}
+				
+				// 如果找到了文件路径，重新加载整个文档
+				if filePath != "" {
+					log.Printf("重新加载完整文档进行检查: %s", filePath)
+					fileLoader := loader.NewFileLoader()
+					docs, err := fileLoader.Load(filePath)
+					if err == nil && len(docs) > 0 {
+						fullContent := ""
+						for _, doc := range docs {
+							fullContent += doc.PageContent + "\n"
+						}
+						allContent = fullContent + "\n" + allContent
+						log.Printf("重新加载文档后，总内容长度: %d", len(allContent))
+					} else {
+						log.Printf("重新加载文档失败: %v", err)
+						// 如果重新加载失败，尝试从文件信息中获取内容预览
+						if fileInfo, exists := s.files[group.FileID]; exists && fileInfo.Content != "" {
+							allContent = fileInfo.Content + "\n" + allContent
+							log.Printf("从文件信息中获取内容预览，总长度: %d", len(allContent))
+						}
+					}
+				} else {
+					log.Printf("无法确定文件路径，尝试从文件信息获取内容，DocSource: %s, FileID: %s, DocTitle: %s", group.DocSource, group.FileID, group.DocTitle)
+					// 如果无法确定文件路径，尝试从文件信息中获取内容预览
+					if fileInfo, exists := s.files[group.FileID]; exists && fileInfo.Content != "" {
+						allContent = fileInfo.Content + "\n" + allContent
+						log.Printf("从文件信息中获取内容预览，总长度: %d", len(allContent))
+					}
+				}
+			}
+			
+			// 检查是否包含"公开形式：不予公开"、"公开形式：依申请公开"或"公开形式：不公开"
+			// 支持全角冒号（：）和半角冒号（:），以及可能的空格和换行
+			// 先尝试精确匹配
+			containsNotPublicFull := strings.Contains(allContent, "公开形式：不予公开")
+			containsApplyPublicFull := strings.Contains(allContent, "公开形式：依申请公开")
+			containsNotPublicFull2 := strings.Contains(allContent, "公开形式：不公开")
+			containsNotPublicHalf := strings.Contains(allContent, "公开形式:不予公开")
+			containsApplyPublicHalf := strings.Contains(allContent, "公开形式:依申请公开")
+			containsNotPublicHalf2 := strings.Contains(allContent, "公开形式:不公开")
+			
+			// 如果精确匹配失败，尝试模糊匹配（允许冒号前后有空格）
+			if !containsNotPublicFull && !containsApplyPublicFull && !containsNotPublicFull2 && !containsNotPublicHalf && !containsApplyPublicHalf && !containsNotPublicHalf2 {
+				// 使用正则表达式或简单的字符串替换来处理空格
+				normalizedContent := strings.ReplaceAll(allContent, " ", "")
+				normalizedContent = strings.ReplaceAll(normalizedContent, "\n", "")
+				normalizedContent = strings.ReplaceAll(normalizedContent, "\r", "")
+				normalizedContent = strings.ReplaceAll(normalizedContent, "\t", "")
+				
+				containsNotPublicFull = strings.Contains(normalizedContent, "公开形式：不予公开")
+				containsApplyPublicFull = strings.Contains(normalizedContent, "公开形式：依申请公开")
+				containsNotPublicFull2 = strings.Contains(normalizedContent, "公开形式：不公开")
+				containsNotPublicHalf = strings.Contains(normalizedContent, "公开形式:不予公开")
+				containsApplyPublicHalf = strings.Contains(normalizedContent, "公开形式:依申请公开")
+				containsNotPublicHalf2 = strings.Contains(normalizedContent, "公开形式:不公开")
+			}
+			
+			if containsNotPublicFull || containsApplyPublicFull || containsNotPublicFull2 || containsNotPublicHalf || containsApplyPublicHalf || containsNotPublicHalf2 {
+				group.HasPublicForm = true
+				log.Printf("✅ 检测到文档 %s (类型: %s, FileID: %s) 包含'公开形式：不予公开'、'公开形式：依申请公开'或'公开形式：不公开' - 将禁止下载，内容长度: %d", group.DocTitle, group.FileType, group.FileID, len(allContent))
+				// 输出检测到的具体内容片段用于确认
+				idx := strings.Index(allContent, "公开形式")
+				if idx >= 0 {
+					start := idx - 20
+					if start < 0 {
+						start = 0
+					}
+					end := idx + 50
+					if end > len(allContent) {
+						end = len(allContent)
+					}
+					log.Printf("检测到的内容片段: ...%s...", allContent[start:end])
+				}
+			} else {
+				// 明确设置为false，确保JSON序列化时包含该字段
+				group.HasPublicForm = false
+				// 输出部分内容用于调试（如果内容不太长）
+				debugContent := allContent
+				if len(debugContent) > 1000 {
+					debugContent = debugContent[:1000] + "..."
+				}
+				log.Printf("❌ 文档 %s (类型: %s, FileID: %s) 未检测到'公开形式：不予公开'、'公开形式：依申请公开'或'公开形式：不公开' - 允许下载，内容长度: %d，前1000字符: %s", group.DocTitle, group.FileType, group.FileID, len(allContent), debugContent)
+			}
+		} else {
+			// 对于非pdf/word/txt文档，不设置HasPublicForm字段
+			log.Printf("文档 %s (类型: %s) 不是PDF/Word/TXT，不检查'公开形式'", group.DocTitle, group.FileType)
+		}
 		docGroups = append(docGroups, *group)
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	// 构建响应数据
+	response := map[string]interface{}{
 		"answer":    queryResult.Answer,
 		"results":   searchResults, // 平铺格式（兼容旧前端）
 		"docGroups": docGroups,     // 按文档分组的格式（新格式）
-	})
+	}
+
+	// 编码响应，确保错误处理
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("编码查询响应失败: %v, 问题: %s", err, req.Question)
+		// 如果编码失败，尝试返回一个简单的错误响应
+		// 注意：此时响应头可能已经部分写入，但这是最后的尝试
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, `{"error":"响应编码失败"}`)
+		return
+	}
+	
+	log.Printf("查询响应已成功发送，答案长度: %d 字符, 文档组数: %d", len(queryResult.Answer), len(docGroups))
 }
 
 // extractOriginalFilename 从文件名中提取原始文件名，去除UUID前缀
