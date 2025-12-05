@@ -958,6 +958,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			log.Printf("检查文档 %s (类型: %s, FileID: %s) 是否包含'公开形式：不予公开'、'公开形式：依申请公开'或'公开形式：不公开'，chunks内容长度: %d", group.DocTitle, group.FileType, group.FileID, len(allContent))
 			
 			// 无论chunks中是否找到，都尝试重新加载整个文档来确保完整检查
+			// 注意：添加了超时控制和文件大小限制，避免内存溢出和服务崩溃
 			if group.FileID != "" {
 				var filePath string
 				// 优先使用DocSource
@@ -978,24 +979,60 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 				
-				// 如果找到了文件路径，重新加载整个文档
+				// 如果找到了文件路径，重新加载整个文档（带超时和大小限制）
 				if filePath != "" {
-					log.Printf("重新加载完整文档进行检查: %s", filePath)
-					fileLoader := loader.NewFileLoader()
-					docs, err := fileLoader.Load(filePath)
-					if err == nil && len(docs) > 0 {
-						fullContent := ""
-						for _, doc := range docs {
-							fullContent += doc.PageContent + "\n"
-						}
-						allContent = fullContent + "\n" + allContent
-						log.Printf("重新加载文档后，总内容长度: %d", len(allContent))
-					} else {
-						log.Printf("重新加载文档失败: %v", err)
-						// 如果重新加载失败，尝试从文件信息中获取内容预览
+					// 检查文件大小，避免重新加载过大的文件（限制为10MB）
+					fileStat, err := os.Stat(filePath)
+					if err == nil && fileStat.Size() > 10*1024*1024 {
+						log.Printf("⚠️ 文件过大（%d MB），跳过重新加载以避免内存溢出: %s", fileStat.Size()/(1024*1024), filePath)
+						// 如果文件过大，尝试从文件信息中获取内容预览
 						if fileInfo, exists := s.files[group.FileID]; exists && fileInfo.Content != "" {
 							allContent = fileInfo.Content + "\n" + allContent
 							log.Printf("从文件信息中获取内容预览，总长度: %d", len(allContent))
+						}
+					} else {
+						log.Printf("重新加载完整文档进行检查: %s", filePath)
+						// 使用带超时的context，避免长时间阻塞（30秒超时）
+						ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+						defer cancel()
+						
+						// 在goroutine中执行加载，以便可以超时取消
+						type loadResult struct {
+							docs []schema.Document
+							err  error
+						}
+						resultChan := make(chan loadResult, 1)
+						
+						go func() {
+							fileLoader := loader.NewFileLoader()
+							docs, err := fileLoader.Load(filePath)
+							resultChan <- loadResult{docs: docs, err: err}
+						}()
+						
+						select {
+						case <-ctx.Done():
+							log.Printf("⚠️ 重新加载文档超时（30秒），跳过: %s", filePath)
+							// 如果超时，尝试从文件信息中获取内容预览
+							if fileInfo, exists := s.files[group.FileID]; exists && fileInfo.Content != "" {
+								allContent = fileInfo.Content + "\n" + allContent
+								log.Printf("从文件信息中获取内容预览，总长度: %d", len(allContent))
+							}
+						case result := <-resultChan:
+							if result.err == nil && len(result.docs) > 0 {
+								fullContent := ""
+								for _, doc := range result.docs {
+									fullContent += doc.PageContent + "\n"
+								}
+								allContent = fullContent + "\n" + allContent
+								log.Printf("重新加载文档后，总内容长度: %d", len(allContent))
+							} else {
+								log.Printf("重新加载文档失败: %v", result.err)
+								// 如果重新加载失败，尝试从文件信息中获取内容预览
+								if fileInfo, exists := s.files[group.FileID]; exists && fileInfo.Content != "" {
+									allContent = fileInfo.Content + "\n" + allContent
+									log.Printf("从文件信息中获取内容预览，总长度: %d", len(allContent))
+								}
+							}
 						}
 					}
 				} else {
