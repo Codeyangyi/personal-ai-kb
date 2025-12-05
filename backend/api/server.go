@@ -1074,11 +1074,18 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		"docGroups": docGroups,     // 按文档分组的格式（新格式）
 	}
 
+	// 设置响应头，确保即使编码失败也能正确返回
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	
 	// 编码响应，确保错误处理
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("编码查询响应失败: %v, 问题: %s", err, req.Question)
 		// 如果编码失败，尝试返回一个简单的错误响应
 		// 注意：此时响应头可能已经部分写入，但这是最后的尝试
+		if w.Header().Get("Content-Type") == "" {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		}
 		w.WriteHeader(http.StatusInternalServerError)
 		fmt.Fprintf(w, `{"error":"响应编码失败"}`)
 		return

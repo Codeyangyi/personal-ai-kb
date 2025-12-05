@@ -308,7 +308,7 @@
 import { ref, computed, onMounted } from 'vue'
 import axios from 'axios'
 
-const API_BASE = '/api'
+ const API_BASE = '/api'
 //const API_BASE = '/rest/api'
 const query = ref('')
 const searching = ref(false)
