@@ -43,14 +43,14 @@ type Config struct {
 func LoadConfig() *Config {
 	return &Config{
 		// LLM配置（默认使用通义千问）
-		LLMProvider:   getEnv("LLM_PROVIDER", "dashscope"), // 默认使用通义千问，可选: "ollama", "dashscope", "kimi"
-		OllamaBaseURL: getEnv("OLLAMA_BASE_URL", "http://localhost:11434"),
-		OllamaModel:   getEnv("OLLAMA_MODEL", "qwen2.5:1.5b"),
-		//DashScopeAPIKey: getEnv("DASHSCOPE_API_KEY", "sk-cde2d6e9f3a84e17a8e58ef474b8ce7c"),                // 通义千问API Key
-		DashScopeAPIKey: getEnv("DASHSCOPE_API_KEY", "sk-737971a5532646ea932b4be190fa1325"),                // 通义千问API Key
-		DashScopeModel:  getEnv("DASHSCOPE_MODEL", "qwen-turbo"),                                           // 默认使用qwen-turbo
-		MoonshotAPIKey:  getEnv("MOONSHOT_API_KEY", "sk-xvtLcD5Gvzq8vxCOeEo8pEqMeqss8T8jIBx0Xdr8BcgX6aog"), // Kimi2 (Moonshot AI) API Key
-		MoonshotModel:   getEnv("MOONSHOT_MODEL", "moonshot-v1-8k"),                                        // 默认使用moonshot-v1-8k
+		LLMProvider:     getEnv("LLM_PROVIDER", "dashscope"), // 默认使用通义千问，可选: "ollama", "dashscope", "kimi"
+		OllamaBaseURL:   getEnv("OLLAMA_BASE_URL", "http://localhost:11434"),
+		OllamaModel:     getEnv("OLLAMA_MODEL", "qwen2.5:1.5b"),
+		DashScopeAPIKey: getEnv("DASHSCOPE_API_KEY", "sk-cde2d6e9f3a84e17a8e58ef474b8ce7c"), // 通义千问API Key
+		//DashScopeAPIKey: getEnv("DASHSCOPE_API_KEY", "sk-737971a5532646ea932b4be190fa1325"),                // 通义千问API Key
+		DashScopeModel: getEnv("DASHSCOPE_MODEL", "qwen-turbo"),                                           // 默认使用qwen-turbo
+		MoonshotAPIKey: getEnv("MOONSHOT_API_KEY", "sk-xvtLcD5Gvzq8vxCOeEo8pEqMeqss8T8jIBx0Xdr8BcgX6aog"), // Kimi2 (Moonshot AI) API Key
+		MoonshotModel:  getEnv("MOONSHOT_MODEL", "moonshot-v1-8k"),                                        // 默认使用moonshot-v1-8k
 
 		QdrantURL:      getEnv("QDRANT_URL", "http://localhost:6333"),
 		QdrantAPIKey:   getEnv("QDRANT_API_KEY", ""),

@@ -65,7 +65,7 @@
                 <div class="doc-group-actions">
                   <span class="doc-group-count">{{ group.chunks.length }} 个相关片段</span>
                   <button
-                    v-if="group.sourceType === 'file' && group.fileId"
+                    v-if="canDownload(group)"
                     @click="downloadFile(group.fileId, group.docTitle, group)"
                     class="download-btn"
                     title="下载文档"
@@ -397,15 +397,6 @@ async function handleSearch() {
     // 优先使用按文档分组的格式（新格式）
     if (response.data.docGroups && response.data.docGroups.length > 0) {
       docGroups.value = response.data.docGroups
-      // 调试：打印文档信息，特别是hasPublicForm字段
-      console.log('接收到的文档组:', docGroups.value.map(g => ({
-        docTitle: g.docTitle,
-        fileType: g.fileType,
-        hasPublicForm: g.hasPublicForm,
-        hasPublicFormType: typeof g.hasPublicForm,
-        fileId: g.fileId,
-        sourceType: g.sourceType
-      })))
     } else if (response.data.results) {
       // 兼容旧格式：如果没有docGroups，使用平铺格式
       searchResults.value = response.data.results
@@ -546,11 +537,6 @@ function canDownload(group) {
       
       // 如果包含"公开形式"字眼，不允许下载
       if (hasPublicForm) {
-        console.log('检测到文档包含"公开形式"，禁止下载:', {
-          docTitle: group.docTitle,
-          fileType: group.fileType,
-          hasPublicForm: group.hasPublicForm
-        })
         return false
       }
       // 如果没有"公开形式"字眼，允许下载
@@ -564,53 +550,15 @@ function canDownload(group) {
 
 // 下载文件
 function downloadFile(fileId, filename, group) {
-  console.log('下载文件:', { fileId, filename, group })
-  
   if (!fileId) {
     showMessageDialog('文件ID不存在，无法下载')
     return
   }
   
-  // 检查是否可以下载
-  if (group) {
-    // 对于PDF、Word、TXT文档，直接检查hasPublicForm字段
-    if (group.fileType) {
-      const fileTypeLower = group.fileType.toLowerCase()
-      if (fileTypeLower === 'pdf' || fileTypeLower === 'doc' || fileTypeLower === 'docx' || fileTypeLower === 'txt') {
-        // 检查 hasPublicForm 字段（可能是 true、'true'、1 或 undefined）
-        const hasPublicForm = group.hasPublicForm === true || group.hasPublicForm === 'true' || group.hasPublicForm === 1
-        
-        console.log('检查下载权限（直接检查）:', {
-          docTitle: group.docTitle,
-          sourceType: group.sourceType,
-          fileId: group.fileId,
-          fileType: group.fileType,
-          hasPublicForm: group.hasPublicForm,
-          hasPublicFormType: typeof group.hasPublicForm,
-          hasPublicFormResult: hasPublicForm
-        })
-        
-        if (hasPublicForm) {
-          showMessageDialog('此文件涉密文件 不提供下载服务')
-          return
-        }
-      }
-    }
-    
-    // 再次使用canDownload函数检查（双重检查）
-    console.log('检查下载权限（canDownload函数）:', {
-      sourceType: group.sourceType,
-      fileId: group.fileId,
-      fileType: group.fileType,
-      hasPublicForm: group.hasPublicForm,
-      hasPublicFormType: typeof group.hasPublicForm,
-      canDownload: canDownload(group)
-    })
-    
-    if (!canDownload(group)) {
-      showMessageDialog('此文件涉密文件 不提供下载服务')
-      return
-    }
+  // 检查是否可以下载（使用canDownload函数统一检查）
+  if (group && !canDownload(group)) {
+    showMessageDialog('此文件涉密文件 不提供下载按钮')
+    return
   }
   
   const url = `${API_BASE}/files/${fileId}`

@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Codeyangyi/personal-ai-kb/config"
@@ -176,7 +177,7 @@ func (s *Server) Start(port string) error {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if err := recover(); err != nil {
-					log.Printf("请求处理发生panic: %v, 请求路径: %s, 方法: %s, 堆栈: %s", 
+					log.Printf("请求处理发生panic: %v, 请求路径: %s, 方法: %s, 堆栈: %s",
 						err, r.URL.Path, r.Method, getStackTrace())
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusInternalServerError)
@@ -756,7 +757,7 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// 提前设置响应头，确保即使发生错误也能正确返回
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	
+
 	if r.Method != "POST" {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -797,7 +798,10 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	tempRAG := rag.NewRAG(s.embedder, s.store, s.llm, req.TopK)
 
 	log.Printf("收到查询请求: %s (topK=%d), 客户端: %s", req.Question, req.TopK, r.RemoteAddr)
-	ctx := context.Background()
+
+	// 优化：使用请求的context，并添加超时控制（60秒），确保请求可以取消
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
 
 	// 使用 QueryWithResults 方法，避免重复搜索
 	queryResult, err := tempRAG.QueryWithResults(ctx, req.Question)
@@ -823,285 +827,429 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	type DocGroup struct {
 		DocTitle      string                   `json:"docTitle"`
 		DocSource     string                   `json:"docSource"`
-		SourceType    string                   `json:"sourceType"` // "file" 或 "url"
+		SourceType    string                   `json:"sourceType"`              // "file" 或 "url"
 		FileType      string                   `json:"fileType,omitempty"`      // 文件类型，如 "pdf", "docx", "txt" 等
 		HasPublicForm bool                     `json:"hasPublicForm,omitempty"` // 是否包含"公开形式"字眼
 		FileID        string                   `json:"fileId,omitempty"`        // 文件ID，用于下载
 		Chunks        []map[string]interface{} `json:"chunks"`
 	}
 
-	docGroupsMap := make(map[string]*DocGroup)
-	var searchResults []map[string]interface{} // 保留平铺格式以兼容旧前端
+	// 优化：使用sync.Map和并发处理文档分组，提升性能
+	type docProcessResult struct {
+		index    int
+		result   map[string]interface{}
+		groupKey string
+		group    *DocGroup
+	}
 
-	// 保持原始索引，不重新编号
-	// 这样编号就能与AI答案中的标注（①、②、③等）完全一致
+	// 使用带缓冲的channel收集处理结果
+	// 限制缓冲区大小，避免大结果集导致内存问题（最多1000个结果）
+	const maxChannelBuffer = 1000
+	bufferSize := len(queryResult.Results)
+	if bufferSize > maxChannelBuffer {
+		bufferSize = maxChannelBuffer
+	}
+	resultChan := make(chan docProcessResult, bufferSize)
+
+	// 并发处理所有文档片段
+	var wg sync.WaitGroup
 	for i, doc := range queryResult.Results {
 		// 检查这个文档片段是否在答案中被标注使用（索引从1开始，所以i+1）
 		if !usedIndices[i+1] {
 			continue
 		}
 
-		// 使用原始索引（i+1），与AI答案中的标注保持一致
-		originalIndex := i + 1
+		wg.Add(1)
+		go func(idx int, d schema.Document) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("⚠️ 处理文档片段时发生panic: %v, 索引: %d", r, idx)
+				}
+			}()
 
-		// 获取文档来源信息
-		var docTitle, docSource, sourceType, fileType, fileID string
-		if source, ok := doc.Metadata["source"].(string); ok {
-			docSource = source
-			// 判断是文件还是URL
-			if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
-				sourceType = "url"
-				docTitle = source // URL直接使用完整URL作为标题
-			} else {
-				sourceType = "file"
-				// 从文件路径中提取原始文件名（去除UUID前缀）
-				docTitle = extractOriginalFilename(filepath.Base(source))
-				// 从文件路径中提取fileID（格式：{fileID}_{原文件名}）
-				baseName := filepath.Base(source)
-				if idx := strings.Index(baseName, "_"); idx > 0 {
-					fileID = baseName[:idx]
+			// 使用原始索引（idx+1），与AI答案中的标注保持一致
+			originalIndex := idx + 1
+
+			// 获取文档来源信息
+			var docTitle, docSource, sourceType, fileType, fileID string
+			if source, ok := d.Metadata["source"].(string); ok {
+				docSource = source
+				// 判断是文件还是URL
+				if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
+					sourceType = "url"
+					docTitle = source // URL直接使用完整URL作为标题
+				} else {
+					sourceType = "file"
+					// 从文件路径中提取原始文件名（去除UUID前缀）
+					docTitle = extractOriginalFilename(filepath.Base(source))
+					// 从文件路径中提取fileID（格式：{fileID}_{原文件名}）
+					baseName := filepath.Base(source)
+					if idx := strings.Index(baseName, "_"); idx > 0 {
+						fileID = baseName[:idx]
+					}
+					// 判断文件类型
+					ext := strings.ToLower(filepath.Ext(docTitle))
+					if ext != "" {
+						fileType = ext[1:] // 去掉点号
+					}
+				}
+			}
+			// 优先使用file_name元数据（如果存在且不包含UUID）
+			if fileName, ok := d.Metadata["file_name"].(string); ok && fileName != "" {
+				// 从file_name中提取原始文件名（去除UUID前缀）
+				originalFileName := extractOriginalFilename(fileName)
+				if originalFileName != "" {
+					docTitle = originalFileName
+				}
+				// 从file_name中提取fileID
+				if idx := strings.Index(fileName, "_"); idx > 0 {
+					fileID = fileName[:idx]
 				}
 				// 判断文件类型
-				ext := strings.ToLower(filepath.Ext(docTitle))
+				ext := strings.ToLower(filepath.Ext(originalFileName))
 				if ext != "" {
 					fileType = ext[1:] // 去掉点号
 				}
 			}
-		}
-		// 优先使用file_name元数据（如果存在且不包含UUID）
-		if fileName, ok := doc.Metadata["file_name"].(string); ok && fileName != "" {
-			// 从file_name中提取原始文件名（去除UUID前缀）
-			originalFileName := extractOriginalFilename(fileName)
-			if originalFileName != "" {
-				docTitle = originalFileName
+			if docTitle == "" {
+				docTitle = "未命名文档"
 			}
-			// 从file_name中提取fileID
-			if idx := strings.Index(fileName, "_"); idx > 0 {
-				fileID = fileName[:idx]
+
+			// 生成预览（前200字符）
+			preview := d.PageContent
+			if len(preview) > 200 {
+				preview = preview[:200] + "..."
 			}
-			// 判断文件类型
-			ext := strings.ToLower(filepath.Ext(originalFileName))
-			if ext != "" {
-				fileType = ext[1:] // 去掉点号
+
+			// 创建文档片段结果
+			result := map[string]interface{}{
+				"content":     d.PageContent,
+				"pageContent": d.PageContent,
+				"index":       originalIndex, // 使用原始索引，与AI答案中的标注保持一致
+				"source":      docSource,
+				"title":       docTitle,
+				"preview":     preview,
 			}
-		}
-		if docTitle == "" {
-			docTitle = "未命名文档"
-		}
 
-		// 生成预览（前200字符）
-		preview := doc.PageContent
-		if len(preview) > 200 {
-			preview = preview[:200] + "..."
-		}
+			// 按文档来源分组
+			groupKey := docSource
+			if groupKey == "" {
+				groupKey = docTitle // 如果没有source，使用title作为分组key
+			}
 
-		// 创建文档片段结果
-		// 使用原始索引（originalIndex），与AI答案中的标注（①、②、③等）完全一致
-		result := map[string]interface{}{
-			"content":     doc.PageContent,
-			"pageContent": doc.PageContent,
-			"index":       originalIndex, // 使用原始索引，与AI答案中的标注保持一致
-			"source":      docSource,
-			"title":       docTitle,
-			"preview":     preview,
-		}
-
-		// 添加到平铺格式（兼容旧前端）
-		searchResults = append(searchResults, result)
-
-		// 按文档来源分组
-		groupKey := docSource
-		if groupKey == "" {
-			groupKey = docTitle // 如果没有source，使用title作为分组key
-		}
-
-		if _, exists := docGroupsMap[groupKey]; !exists {
-			docGroupsMap[groupKey] = &DocGroup{
+			// 创建文档组
+			group := &DocGroup{
 				DocTitle:   docTitle,
 				DocSource:  docSource,
 				SourceType: sourceType,
 				FileType:   fileType,
 				FileID:     fileID,
-				Chunks:     []map[string]interface{}{},
+				Chunks:     []map[string]interface{}{result},
 			}
-		} else {
-			// 如果组已存在，更新文件类型和文件ID（如果当前文档片段有这些信息）
-			if fileType != "" && docGroupsMap[groupKey].FileType == "" {
-				docGroupsMap[groupKey].FileType = fileType
+
+			resultChan <- docProcessResult{
+				index:    originalIndex,
+				result:   result,
+				groupKey: groupKey,
+				group:    group,
 			}
-			if fileID != "" && docGroupsMap[groupKey].FileID == "" {
-				docGroupsMap[groupKey].FileID = fileID
-			}
-		}
-		docGroupsMap[groupKey].Chunks = append(docGroupsMap[groupKey].Chunks, result)
+		}(i, doc)
 	}
 
+	// 等待所有goroutine完成
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// 收集结果并分组
+	docGroupsMap := make(map[string]*DocGroup)
+	var searchResults []map[string]interface{} // 保留平铺格式以兼容旧前端
+
+	// 使用sync.Map确保并发安全
+	var mu sync.Mutex
+
+	// 收集所有结果
+	for res := range resultChan {
+		mu.Lock()
+		// 添加到平铺格式（兼容旧前端）
+		searchResults = append(searchResults, res.result)
+
+		// 按文档来源分组
+		if existingGroup, exists := docGroupsMap[res.groupKey]; exists {
+			// 如果组已存在，更新文件类型和文件ID（如果当前文档片段有这些信息）
+			if res.group.FileType != "" && existingGroup.FileType == "" {
+				existingGroup.FileType = res.group.FileType
+			}
+			if res.group.FileID != "" && existingGroup.FileID == "" {
+				existingGroup.FileID = res.group.FileID
+			}
+			existingGroup.Chunks = append(existingGroup.Chunks, res.result)
+		} else {
+			// 创建新组
+			docGroupsMap[res.groupKey] = res.group
+		}
+		mu.Unlock()
+	}
+
+	// 对searchResults按index排序，确保顺序正确
+	sort.Slice(searchResults, func(i, j int) bool {
+		idxI, _ := searchResults[i]["index"].(int)
+		idxJ, _ := searchResults[j]["index"].(int)
+		return idxI < idxJ
+	})
+
 	// 将 map 转换为 slice，并检查pdf、word、txt文档中是否包含"公开形式"字眼
+	// 优化：并行处理文档检查，避免串行阻塞
 	docGroups := make([]DocGroup, 0, len(docGroupsMap))
-	for _, group := range docGroupsMap {
+
+	// 创建一个辅助函数来检查单个文档
+	checkPublicForm := func(group *DocGroup) {
 		// 只对pdf、word、txt文档检查是否包含"公开形式：不予公开"或"公开形式：依申请公开"
 		fileTypeLower := strings.ToLower(group.FileType)
-		if fileTypeLower == "pdf" || fileTypeLower == "doc" || fileTypeLower == "docx" || fileTypeLower == "txt" {
-			// 先检查返回的chunks内容
-			allContent := ""
-			for _, chunk := range group.Chunks {
-				// 尝试多个可能的字段名
-				if content, ok := chunk["content"].(string); ok && content != "" {
-					allContent += content + "\n"
-				} else if content, ok := chunk["pageContent"].(string); ok && content != "" {
-					allContent += content + "\n"
-				} else if content, ok := chunk["preview"].(string); ok && content != "" {
-					allContent += content + "\n"
-				}
+		if fileTypeLower != "pdf" && fileTypeLower != "doc" && fileTypeLower != "docx" && fileTypeLower != "txt" {
+			// 对于非pdf/word/txt文档，不设置HasPublicForm字段
+			log.Printf("文档 %s (类型: %s) 不是PDF/Word/TXT，不检查'公开形式'", group.DocTitle, group.FileType)
+			return
+		}
+
+		// 先检查返回的chunks内容，收集所有内容
+		// 限制总大小，避免内存溢出（最多收集100KB的内容）
+		const maxContentSize = 100 * 1024 // 100KB
+		allContent := strings.Builder{}
+		allContent.Grow(2000) // 预分配2KB
+		totalSize := 0
+		
+		for _, chunk := range group.Chunks {
+			if totalSize >= maxContentSize {
+				break // 达到限制，停止收集
 			}
 			
-			log.Printf("检查文档 %s (类型: %s, FileID: %s) 是否包含'公开形式：不予公开'、'公开形式：依申请公开'或'公开形式：不公开'，chunks内容长度: %d", group.DocTitle, group.FileType, group.FileID, len(allContent))
+			// 尝试多个可能的字段名
+			var content string
+			if c, ok := chunk["content"].(string); ok && c != "" {
+				content = c
+			} else if c, ok = chunk["pageContent"].(string); ok && c != "" {
+				content = c
+			} else if c, ok = chunk["preview"].(string); ok && c != "" {
+				content = c
+			}
 			
-			// 无论chunks中是否找到，都尝试重新加载整个文档来确保完整检查
-			// 注意：添加了超时控制和文件大小限制，避免内存溢出和服务崩溃
-			if group.FileID != "" {
-				var filePath string
-				// 优先使用DocSource
-				if group.DocSource != "" && !strings.HasPrefix(group.DocSource, "http://") && !strings.HasPrefix(group.DocSource, "https://") {
-					if _, err := os.Stat(group.DocSource); err == nil {
-						filePath = group.DocSource
+			if content != "" {
+				// 如果加上这个内容会超过限制，只取部分
+				if totalSize+len(content) > maxContentSize {
+					remaining := maxContentSize - totalSize
+					if remaining > 0 {
+						allContent.WriteString(content[:remaining])
+						totalSize = maxContentSize
 					}
+					break
 				}
-				
-				// 如果DocSource不存在，尝试从FileID和DocTitle构建路径
-				if filePath == "" {
-					newFormatPath := filepath.Join(s.filesDir, group.FileID+"_"+group.DocTitle)
-					oldFormatPath := filepath.Join(s.filesDir, group.FileID+filepath.Ext(group.DocTitle))
+				allContent.WriteString(content)
+				allContent.WriteString("\n")
+				totalSize += len(content) + 1
+			}
+		}
+
+		// 如果文件信息中有内容预览，也加入检查（但不超过限制）
+		if group.FileID != "" && totalSize < maxContentSize {
+			if fileInfo, exists := s.files[group.FileID]; exists && fileInfo.Content != "" {
+				preview := fileInfo.Content
+				remaining := maxContentSize - totalSize
+				if len(preview) > remaining {
+					preview = preview[:remaining]
+				}
+				allContent.WriteString(preview)
+				allContent.WriteString("\n")
+				totalSize += len(preview) + 1
+			}
+		}
+
+		allContentStr := allContent.String()
+		// 只检查文档内容的最后部分（最后2000个字符）
+		// 因为"公开形式"通常在文档末尾
+		contentToCheck := allContentStr
+		if len(contentToCheck) > 2000 {
+			contentToCheck = contentToCheck[len(contentToCheck)-2000:]
+		}
+
+		log.Printf("检查文档 %s (类型: %s, FileID: %s) 最后部分是否包含'公开形式'，检查内容长度: %d (总长度: %d)", group.DocTitle, group.FileType, group.FileID, len(contentToCheck), len(allContentStr))
+
+		// 如果chunks中没有找到，尝试重新加载文档并检查最后部分
+		if len(contentToCheck) == 0 || !checkPublicFormInContent(contentToCheck) {
+			if group.FileID != "" {
+				if fileInfo, exists := s.files[group.FileID]; exists {
+					// 构建文件路径
+					var filePath string
+					newFormatPath := filepath.Join(s.filesDir, group.FileID+"_"+fileInfo.Filename)
+					oldFormatPath := filepath.Join(s.filesDir, group.FileID+filepath.Ext(fileInfo.Filename))
+
+					// 优先尝试新格式
 					if _, err := os.Stat(newFormatPath); err == nil {
 						filePath = newFormatPath
 					} else if _, err := os.Stat(oldFormatPath); err == nil {
 						filePath = oldFormatPath
 					}
-				}
-				
-				// 如果找到了文件路径，重新加载整个文档（带超时和大小限制）
-				if filePath != "" {
-					// 检查文件大小，避免重新加载过大的文件（限制为10MB）
-					fileStat, err := os.Stat(filePath)
-					if err == nil && fileStat.Size() > 10*1024*1024 {
-						log.Printf("⚠️ 文件过大（%d MB），跳过重新加载以避免内存溢出: %s", fileStat.Size()/(1024*1024), filePath)
-						// 如果文件过大，尝试从文件信息中获取内容预览
-						if fileInfo, exists := s.files[group.FileID]; exists && fileInfo.Content != "" {
-							allContent = fileInfo.Content + "\n" + allContent
-							log.Printf("从文件信息中获取内容预览，总长度: %d", len(allContent))
-						}
-					} else {
-						log.Printf("重新加载完整文档进行检查: %s", filePath)
-						// 使用带超时的context，避免长时间阻塞（30秒超时）
-						ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-						defer cancel()
-						
-						// 在goroutine中执行加载，以便可以超时取消
-						type loadResult struct {
-							docs []schema.Document
-							err  error
-						}
-						resultChan := make(chan loadResult, 1)
-						
-						go func() {
-							fileLoader := loader.NewFileLoader()
-							docs, err := fileLoader.Load(filePath)
-							resultChan <- loadResult{docs: docs, err: err}
-						}()
-						
-						select {
-						case <-ctx.Done():
-							log.Printf("⚠️ 重新加载文档超时（30秒），跳过: %s", filePath)
-							// 如果超时，尝试从文件信息中获取内容预览
-							if fileInfo, exists := s.files[group.FileID]; exists && fileInfo.Content != "" {
-								allContent = fileInfo.Content + "\n" + allContent
-								log.Printf("从文件信息中获取内容预览，总长度: %d", len(allContent))
+
+					if filePath != "" {
+						// 对于TXT文件，直接读取文件的最后部分
+						if fileTypeLower == "txt" {
+							if fileContent, err := readFileLastBytes(filePath, 2000); err == nil {
+								contentToCheck = fileContent
+								log.Printf("从TXT文件读取最后部分，长度: %d", len(contentToCheck))
 							}
-						case result := <-resultChan:
-							if result.err == nil && len(result.docs) > 0 {
-								fullContent := ""
-								for _, doc := range result.docs {
-									fullContent += doc.PageContent + "\n"
+						} else if fileTypeLower == "pdf" || fileTypeLower == "doc" || fileTypeLower == "docx" {
+							// 对于PDF和Word文件，只加载文档的最后部分
+							lastContent, err := loadDocumentLastPart(filePath, fileTypeLower)
+							if err == nil && lastContent != "" {
+								// 只检查最后2000个字符
+								if len(lastContent) > 2000 {
+									contentToCheck = lastContent[len(lastContent)-2000:]
+								} else {
+									contentToCheck = lastContent
 								}
-								allContent = fullContent + "\n" + allContent
-								log.Printf("重新加载文档后，总内容长度: %d", len(allContent))
+								log.Printf("加载文档最后部分并检查，检查内容长度: %d (总长度: %d)", len(contentToCheck), len(lastContent))
 							} else {
-								log.Printf("重新加载文档失败: %v", result.err)
-								// 如果重新加载失败，尝试从文件信息中获取内容预览
-								if fileInfo, exists := s.files[group.FileID]; exists && fileInfo.Content != "" {
-									allContent = fileInfo.Content + "\n" + allContent
-									log.Printf("从文件信息中获取内容预览，总长度: %d", len(allContent))
-								}
+								log.Printf("加载文档最后部分失败: %v", err)
 							}
 						}
 					}
-				} else {
-					log.Printf("无法确定文件路径，尝试从文件信息获取内容，DocSource: %s, FileID: %s, DocTitle: %s", group.DocSource, group.FileID, group.DocTitle)
-					// 如果无法确定文件路径，尝试从文件信息中获取内容预览
-					if fileInfo, exists := s.files[group.FileID]; exists && fileInfo.Content != "" {
-						allContent = fileInfo.Content + "\n" + allContent
-						log.Printf("从文件信息中获取内容预览，总长度: %d", len(allContent))
-					}
 				}
 			}
-			
-			// 检查是否包含"公开形式：不予公开"、"公开形式：依申请公开"或"公开形式：不公开"
-			// 支持全角冒号（：）和半角冒号（:），以及可能的空格和换行
-			// 先尝试精确匹配
-			containsNotPublicFull := strings.Contains(allContent, "公开形式：不予公开")
-			containsApplyPublicFull := strings.Contains(allContent, "公开形式：依申请公开")
-			containsNotPublicFull2 := strings.Contains(allContent, "公开形式：不公开")
-			containsNotPublicHalf := strings.Contains(allContent, "公开形式:不予公开")
-			containsApplyPublicHalf := strings.Contains(allContent, "公开形式:依申请公开")
-			containsNotPublicHalf2 := strings.Contains(allContent, "公开形式:不公开")
-			
-			// 如果精确匹配失败，尝试模糊匹配（允许冒号前后有空格）
-			if !containsNotPublicFull && !containsApplyPublicFull && !containsNotPublicFull2 && !containsNotPublicHalf && !containsApplyPublicHalf && !containsNotPublicHalf2 {
-				// 使用正则表达式或简单的字符串替换来处理空格
-				normalizedContent := strings.ReplaceAll(allContent, " ", "")
-				normalizedContent = strings.ReplaceAll(normalizedContent, "\n", "")
-				normalizedContent = strings.ReplaceAll(normalizedContent, "\r", "")
-				normalizedContent = strings.ReplaceAll(normalizedContent, "\t", "")
-				
-				containsNotPublicFull = strings.Contains(normalizedContent, "公开形式：不予公开")
-				containsApplyPublicFull = strings.Contains(normalizedContent, "公开形式：依申请公开")
-				containsNotPublicFull2 = strings.Contains(normalizedContent, "公开形式：不公开")
-				containsNotPublicHalf = strings.Contains(normalizedContent, "公开形式:不予公开")
-				containsApplyPublicHalf = strings.Contains(normalizedContent, "公开形式:依申请公开")
-				containsNotPublicHalf2 = strings.Contains(normalizedContent, "公开形式:不公开")
-			}
-			
-			if containsNotPublicFull || containsApplyPublicFull || containsNotPublicFull2 || containsNotPublicHalf || containsApplyPublicHalf || containsNotPublicHalf2 {
-				group.HasPublicForm = true
-				log.Printf("✅ 检测到文档 %s (类型: %s, FileID: %s) 包含'公开形式：不予公开'、'公开形式：依申请公开'或'公开形式：不公开' - 将禁止下载，内容长度: %d", group.DocTitle, group.FileType, group.FileID, len(allContent))
-				// 输出检测到的具体内容片段用于确认
-				idx := strings.Index(allContent, "公开形式")
-				if idx >= 0 {
-					start := idx - 20
-					if start < 0 {
-						start = 0
-					}
-					end := idx + 50
-					if end > len(allContent) {
-						end = len(allContent)
-					}
-					log.Printf("检测到的内容片段: ...%s...", allContent[start:end])
+		}
+
+		// 检查最后部分是否包含"公开形式"
+		hasPublicForm := checkPublicFormInContent(contentToCheck)
+
+		if hasPublicForm {
+			group.HasPublicForm = true
+			log.Printf("✅ 检测到文档 %s (类型: %s, FileID: %s) 最后部分包含'公开形式' - 将禁止下载", group.DocTitle, group.FileType, group.FileID)
+			// 输出检测到的具体内容片段用于确认
+			idx := strings.Index(contentToCheck, "公开形式")
+			if idx >= 0 {
+				start := idx - 20
+				if start < 0 {
+					start = 0
 				}
-			} else {
-				// 明确设置为false，确保JSON序列化时包含该字段
-				group.HasPublicForm = false
-				// 输出部分内容用于调试（如果内容不太长）
-				debugContent := allContent
-				if len(debugContent) > 1000 {
-					debugContent = debugContent[:1000] + "..."
+				end := idx + 50
+				if end > len(contentToCheck) {
+					end = len(contentToCheck)
 				}
-				log.Printf("❌ 文档 %s (类型: %s, FileID: %s) 未检测到'公开形式：不予公开'、'公开形式：依申请公开'或'公开形式：不公开' - 允许下载，内容长度: %d，前1000字符: %s", group.DocTitle, group.FileType, group.FileID, len(allContent), debugContent)
+				log.Printf("检测到的内容片段: ...%s...", contentToCheck[start:end])
 			}
 		} else {
-			// 对于非pdf/word/txt文档，不设置HasPublicForm字段
-			log.Printf("文档 %s (类型: %s) 不是PDF/Word/TXT，不检查'公开形式'", group.DocTitle, group.FileType)
+			// 明确设置为false，确保JSON序列化时包含该字段
+			group.HasPublicForm = false
+			log.Printf("❌ 文档 %s (类型: %s, FileID: %s) 最后部分未检测到'公开形式' - 允许下载", group.DocTitle, group.FileType, group.FileID)
 		}
-		docGroups = append(docGroups, *group)
+	}
+
+	// 并行处理所有文档检查
+	type checkResult struct {
+		groupKey string // 使用docSource作为唯一标识
+		group    *DocGroup
+	}
+	
+	// 限制channel缓冲区大小，避免内存问题
+	docGroupsCount := len(docGroupsMap)
+	const maxCheckBuffer = 100
+	checkBufferSize := docGroupsCount
+	if checkBufferSize > maxCheckBuffer {
+		checkBufferSize = maxCheckBuffer
+	}
+	checkChan := make(chan checkResult, checkBufferSize)
+
+	// 使用WaitGroup确保所有goroutine完成
+	var checkWg sync.WaitGroup
+	
+	// 启动goroutine并行检查所有文档
+	// 为每个文档检查添加超时控制（10秒），避免单个文档检查时间过长导致整体超时
+	checkCtx, checkCancel := context.WithTimeout(ctx, 10*time.Second)
+	defer checkCancel()
+	
+	for groupKey, group := range docGroupsMap {
+		checkWg.Add(1)
+		go func(key string, g *DocGroup) {
+			defer checkWg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("⚠️ 检查文档时发生panic: %v, 文档: %s", r, g.DocTitle)
+					// 发生panic时，设置默认值并继续
+					g.HasPublicForm = false
+				}
+			}()
+			
+			// 使用带超时的context检查文档
+			done := make(chan bool, 1)
+			go func() {
+				checkPublicForm(g)
+				done <- true
+			}()
+			
+			// 等待完成或超时
+			select {
+			case <-done:
+				// 检查完成
+			case <-checkCtx.Done():
+				// 超时，设置默认值
+				log.Printf("⚠️ 文档检查超时: %s", g.DocTitle)
+				g.HasPublicForm = false
+			}
+			
+			// 发送结果（使用select避免阻塞）
+			select {
+			case checkChan <- checkResult{groupKey: key, group: g}:
+			default:
+				// channel已满，记录警告但继续（不会阻塞）
+				log.Printf("⚠️ 检查结果channel已满，跳过文档: %s", g.DocTitle)
+			}
+		}(groupKey, group)
+	}
+
+	// 等待所有检查完成，然后关闭channel
+	go func() {
+		checkWg.Wait()
+		close(checkChan)
+	}()
+	
+	// 设置收集结果的超时时间（15秒），确保不会无限等待
+	collectCtx, collectCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer collectCancel()
+	
+	// 收集所有检查结果（带超时控制）
+	checkedGroups := make(map[string]*DocGroup, docGroupsCount)
+	collectDone := make(chan bool, 1)
+	
+	go func() {
+		for result := range checkChan {
+			checkedGroups[result.groupKey] = result.group
+		}
+		collectDone <- true
+	}()
+	
+	// 等待收集完成或超时
+	select {
+	case <-collectDone:
+		// 收集完成
+	case <-collectCtx.Done():
+		// 超时，记录警告但继续处理已收集的结果
+		log.Printf("⚠️ 文档检查结果收集超时，已收集 %d/%d 个结果", len(checkedGroups), docGroupsCount)
+	}
+	
+	// 如果有些文档没有收到结果（可能因为channel满了），使用原始group
+	if len(checkedGroups) < docGroupsCount {
+		log.Printf("⚠️ 警告：只收到 %d/%d 个文档的检查结果", len(checkedGroups), docGroupsCount)
+	}
+
+	// 按原始顺序添加到docGroups
+	for groupKey, group := range docGroupsMap {
+		if checkedGroup, exists := checkedGroups[groupKey]; exists {
+			docGroups = append(docGroups, *checkedGroup)
+		} else {
+			// 如果检查失败，使用原始group
+			docGroups = append(docGroups, *group)
+		}
 	}
 
 	// 构建响应数据
@@ -1114,7 +1262,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// 设置响应头，确保即使编码失败也能正确返回
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-	
+
 	// 编码响应，确保错误处理
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("编码查询响应失败: %v, 问题: %s", err, req.Question)
@@ -1127,8 +1275,190 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `{"error":"响应编码失败"}`)
 		return
 	}
-	
+
 	log.Printf("查询响应已成功发送，答案长度: %d 字符, 文档组数: %d", len(queryResult.Answer), len(docGroups))
+}
+
+// loadDocumentLastPart 加载PDF或Word文档的最后部分（只加载最后几页/最后部分内容）
+// 避免加载整个文档，节省内存
+// 添加超时控制，避免大文件加载时间过长
+func loadDocumentLastPart(filePath string, fileType string) (string, error) {
+	// 创建带超时的context（5秒），避免大文件加载时间过长
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	// 在goroutine中加载文档，以便可以超时取消
+	type loadResult struct {
+		docs []schema.Document
+		err  error
+	}
+	resultChan := make(chan loadResult, 1)
+	
+	go func() {
+		fileLoader := loader.NewFileLoader()
+		docs, err := fileLoader.Load(filePath)
+		resultChan <- loadResult{docs: docs, err: err}
+	}()
+	
+	var docs []schema.Document
+	var err error
+	
+	select {
+	case result := <-resultChan:
+		docs = result.docs
+		err = result.err
+	case <-ctx.Done():
+		return "", fmt.Errorf("加载文档超时（超过5秒）")
+	}
+	
+	if err != nil {
+		return "", fmt.Errorf("加载文档失败: %w", err)
+	}
+	
+	if len(docs) == 0 {
+		return "", fmt.Errorf("文档为空")
+	}
+	
+	// 对于PDF，通常每个文档代表一页，我们只取最后几页
+	// 对于Word，通常只有一个文档，我们只取最后部分
+	const maxPagesToLoad = 2        // 最多加载最后2页
+	const maxContentSize = 500 * 1024 // 最多500KB内容
+	
+	var lastContent strings.Builder
+	lastContent.Grow(2000) // 预分配2KB
+	
+	totalSize := 0
+	
+	// 从后往前收集内容
+	startIdx := 0
+	if len(docs) > maxPagesToLoad {
+		startIdx = len(docs) - maxPagesToLoad
+	}
+	
+	// 为了保持顺序（从后往前），我们需要先收集，然后反转
+	// 但为了简单，我们直接收集最后几页的内容
+	for i := startIdx; i < len(docs) && totalSize < maxContentSize; i++ {
+		content := docs[i].PageContent
+		
+		// 如果加上这个内容会超过限制，只取部分
+		if totalSize+len(content) > maxContentSize {
+			remaining := maxContentSize - totalSize
+			if remaining > 0 {
+				// 对于最后一页，只取内容的最后部分
+				if i == len(docs)-1 {
+					contentStart := len(content) - remaining
+					if contentStart < 0 {
+						contentStart = 0
+					}
+					lastContent.WriteString(content[contentStart:])
+				} else {
+					// 对于前面的页，跳过
+					break
+				}
+			}
+			totalSize = maxContentSize
+			break
+		}
+		
+		lastContent.WriteString(content)
+		lastContent.WriteString("\n")
+		totalSize += len(content) + 1
+	}
+	
+	return lastContent.String(), nil
+}
+
+// readFileLastBytes 读取文件的最后N个字节（尝试按UTF-8解码）
+func readFileLastBytes(filePath string, maxBytes int) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	// 获取文件大小
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+
+	fileSize := fileInfo.Size()
+	if fileSize == 0 {
+		return "", nil
+	}
+
+	// 计算要读取的字节数
+	bytesToRead := int64(maxBytes)
+	if fileSize < bytesToRead {
+		bytesToRead = fileSize
+	}
+
+	// 定位到文件末尾
+	_, err = file.Seek(fileSize-bytesToRead, 0)
+	if err != nil {
+		return "", err
+	}
+
+	// 读取最后N个字节
+	buffer := make([]byte, bytesToRead)
+	n, err := file.Read(buffer)
+	if err != nil && err != io.EOF {
+		return "", err
+	}
+
+	// 尝试按UTF-8解码
+	content := string(buffer[:n])
+	return content, nil
+}
+
+// checkPublicFormInContent 检查内容中是否包含"公开形式"相关字样
+// 支持全角冒号（：）和半角冒号（:），以及可能的空格和换行
+// 如果内容中包含"公开形式"四个字，就认为包含（因为用户需求是检查是否有"公开形式"）
+func checkPublicFormInContent(content string) bool {
+	if content == "" {
+		return false
+	}
+
+	// 首先检查是否包含"公开形式"四个字（这是最基本的检查）
+	if strings.Contains(content, "公开形式") {
+		return true
+	}
+
+	// 如果直接包含"公开形式"四个字，已经返回true
+	// 下面的代码是为了更精确的匹配，但上面的检查已经足够了
+	// 先尝试精确匹配
+	containsNotPublicFull := strings.Contains(content, "公开形式：不予公开")
+	containsApplyPublicFull := strings.Contains(content, "公开形式：依申请公开")
+	containsNotPublicFull2 := strings.Contains(content, "公开形式：不公开")
+	containsNotPublicHalf := strings.Contains(content, "公开形式:不予公开")
+	containsApplyPublicHalf := strings.Contains(content, "公开形式:依申请公开")
+	containsNotPublicHalf2 := strings.Contains(content, "公开形式:不公开")
+
+	if containsNotPublicFull || containsApplyPublicFull || containsNotPublicFull2 ||
+		containsNotPublicHalf || containsApplyPublicHalf || containsNotPublicHalf2 {
+		return true
+	}
+
+	// 如果精确匹配失败，尝试模糊匹配（允许冒号前后有空格）
+	normalizedContent := strings.ReplaceAll(content, " ", "")
+	normalizedContent = strings.ReplaceAll(normalizedContent, "\n", "")
+	normalizedContent = strings.ReplaceAll(normalizedContent, "\r", "")
+	normalizedContent = strings.ReplaceAll(normalizedContent, "\t", "")
+
+	// 在规范化后的内容中也检查"公开形式"四个字
+	if strings.Contains(normalizedContent, "公开形式") {
+		return true
+	}
+
+	containsNotPublicFull = strings.Contains(normalizedContent, "公开形式：不予公开")
+	containsApplyPublicFull = strings.Contains(normalizedContent, "公开形式：依申请公开")
+	containsNotPublicFull2 = strings.Contains(normalizedContent, "公开形式：不公开")
+	containsNotPublicHalf = strings.Contains(normalizedContent, "公开形式:不予公开")
+	containsApplyPublicHalf = strings.Contains(normalizedContent, "公开形式:依申请公开")
+	containsNotPublicHalf2 = strings.Contains(normalizedContent, "公开形式:不公开")
+
+	return containsNotPublicFull || containsApplyPublicFull || containsNotPublicFull2 ||
+		containsNotPublicHalf || containsApplyPublicHalf || containsNotPublicHalf2
 }
 
 // extractOriginalFilename 从文件名中提取原始文件名，去除UUID前缀
