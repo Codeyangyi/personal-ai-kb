@@ -76,7 +76,7 @@ func LoadConfig() *Config {
 		ServerPort: getEnv("SERVER_PORT", "8005"),   // 默认端口: 8005
 
 		// MySQL 配置（可选，如果不配置则不启用数据库相关功能）
-		MySQLDSN: getEnv("MYSQL_DSN", "root:123456@tcp(127.0.0.1:3306)/ai_kb?charset=utf8mb4"),
+		//MySQLDSN: getEnv("MYSQL_DSN", "root:123456@tcp(127.0.0.1:3306)/ai_kb?charset=utf8mb4"),
 		//MySQLDSN: getEnv("MYSQL_DSN", "personal-ai-kb:6mcETznRjwdmK7XN@tcp(127.0.0.1:3306)/ai_kb?charset=utf8mb4"),
 	}
 }

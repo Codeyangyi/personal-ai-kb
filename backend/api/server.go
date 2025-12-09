@@ -51,6 +51,12 @@ type DocGroup struct {
 	Chunks        []map[string]interface{} `json:"chunks"`
 }
 
+// checkTaskWithResult 包含检查任务和结果channel的结构体
+type checkTaskWithResult struct {
+	group      *DocGroup
+	resultChan chan bool
+}
+
 // Server HTTP API服务器
 type Server struct {
 	ragSystem      *rag.RAG
@@ -65,9 +71,8 @@ type Server struct {
 	db             *sql.DB              // MySQL 连接（用于业务数据，如意见反馈）
 	
 	// 异步检查相关
-	checkQueue     chan *DocGroup        // 检查任务队列
-	publicFormCache sync.Map             // 缓存检查结果：fileID -> bool
-	checkWorkers   int                   // 检查工作协程数量
+	checkQueue     chan *checkTaskWithResult // 检查任务队列（包含结果channel）
+	checkWorkers   int                       // 检查工作协程数量
 }
 
 // NewServer 创建新的API服务器
@@ -176,8 +181,8 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		failedFilesDir: failedFilesDir,
 		files:          make(map[string]*FileInfo),
 		db:             db,
-		checkQueue:     make(chan *DocGroup, 100), // 检查任务队列，缓冲区100
-		checkWorkers:   3,                         // 3个工作协程处理检查任务
+		checkQueue:     make(chan *checkTaskWithResult, 100), // 检查任务队列，缓冲区100
+		checkWorkers:   3,                                    // 3个工作协程处理检查任务
 	}
 
 	// 从磁盘恢复文件列表
@@ -1041,279 +1046,154 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return idxI < idxJ
 	})
 
-	// 将 map 转换为 slice，并检查pdf、word、txt文档中是否包含"公开形式"字眼
-	// 优化：并行处理文档检查，避免串行阻塞
+	// 将 map 转换为 slice，并异步检查pdf、word、txt文档中是否包含"公开形式"字眼
+	// 完全异步：主请求立即返回，检查在后台进行
 	docGroups := make([]DocGroup, 0, len(docGroupsMap))
 
-	// 创建一个辅助函数来检查单个文档
-	checkPublicForm := func(group *DocGroup) {
-		// 只对pdf、word、txt文档检查是否包含"公开形式：不予公开"或"公开形式：依申请公开"
+	// 先将所有文档放入异步检查队列，等待一小段时间看是否能快速完成
+	checkTasks := make([]*checkTaskWithResult, 0)
+	for _, group := range docGroupsMap {
+		// 只对pdf、word、txt文档检查
 		fileTypeLower := strings.ToLower(group.FileType)
-		if fileTypeLower != "pdf" && fileTypeLower != "doc" && fileTypeLower != "docx" && fileTypeLower != "txt" {
-			// 对于非pdf/word/txt文档，不设置HasPublicForm字段
-			log.Printf("文档 %s (类型: %s) 不是PDF/Word/TXT，不检查'公开形式'", group.DocTitle, group.FileType)
-			return
-		}
-
-		// 先检查缓存中是否有结果
-		if group.FileID != "" {
-			if cached, ok := s.publicFormCache.Load(group.FileID); ok {
-				hasPublicForm := cached.(bool)
-				if hasPublicForm {
-					log.Printf("✅ 从缓存获取：文档 %s 包含'公开形式'", group.DocTitle)
-				} else {
-					log.Printf("✅ 从缓存获取：文档 %s 不包含'公开形式'", group.DocTitle)
-				}
-				group.HasPublicForm = hasPublicForm
-				return
+		if (fileTypeLower == "pdf" || fileTypeLower == "doc" || fileTypeLower == "docx" || fileTypeLower == "txt") && group.FileID != "" {
+			// 创建结果channel，用于等待检查结果
+			resultChan := make(chan bool, 1)
+			
+			// 创建检查任务，放入异步队列
+			checkTask := &checkTaskWithResult{
+				group:      group,
+				resultChan: resultChan,
 			}
-		}
-
-		// 直接读取文档的最后100个字符进行检查（不从chunks中读取）
-		// 将任务放入异步检查队列，并等待一小段时间看是否能快速完成
-		if group.FileID != "" {
-			// 先放入队列
+			
+			// 尝试放入队列（非阻塞）
 			select {
-			case s.checkQueue <- group:
-				log.Printf("📋 文档 %s 已加入异步检查队列（直接读取文件最后100个字符）", group.DocTitle)
+			case s.checkQueue <- checkTask:
+				log.Printf("📋 文档 %s 已加入异步检查队列", group.DocTitle)
+				checkTasks = append(checkTasks, checkTask)
 			default:
-				// 队列已满，记录警告但继续（不阻塞）
-				log.Printf("⚠️ 检查队列已满，跳过异步检查: %s", group.DocTitle)
-				group.HasPublicForm = false
-				return
-			}
-			
-			// 等待一小段时间（500ms），看异步检查是否能快速完成
-			// 这样可以避免第一次查询时总是允许下载
-			time.Sleep(500 * time.Millisecond)
-			
-			// 再次检查缓存，看异步检查是否已完成
-			if cached, ok := s.publicFormCache.Load(group.FileID); ok {
-				hasPublicForm := cached.(bool)
-				if hasPublicForm {
-					log.Printf("✅ 等待后从缓存获取：文档 %s 包含'公开形式'", group.DocTitle)
-				} else {
-					log.Printf("✅ 等待后从缓存获取：文档 %s 不包含'公开形式'", group.DocTitle)
-				}
-				group.HasPublicForm = hasPublicForm
-			} else {
-				// 如果还没完成，先允许下载（异步检查会更新缓存，下次查询时会使用）
-				log.Printf("⏳ 文档 %s 异步检查尚未完成，先允许下载（下次查询时会使用缓存结果）", group.DocTitle)
-				group.HasPublicForm = false
+				// 队列已满，记录警告，使用更安全的默认值（不允许下载）
+				log.Printf("⚠️ 检查队列已满，跳过异步检查: %s（使用安全默认值：不允许下载）", group.DocTitle)
+				group.HasPublicForm = true // 改为true，不允许下载（更安全）
 			}
 		} else {
-			// 没有FileID，无法检查，默认允许下载
+			// 非pdf/word/txt文档，不需要检查，允许下载
 			group.HasPublicForm = false
 		}
 	}
-
-	// 并行处理所有文档检查
-	type checkResult struct {
-		groupKey string // 使用docSource作为唯一标识
-		group    *DocGroup
-	}
-
-	// 限制channel缓冲区大小，避免内存问题
-	docGroupsCount := len(docGroupsMap)
-	const maxCheckBuffer = 100
-	checkBufferSize := docGroupsCount
-	if checkBufferSize > maxCheckBuffer {
-		checkBufferSize = maxCheckBuffer
-	}
-	checkChan := make(chan checkResult, checkBufferSize)
-
-	// 使用WaitGroup确保所有goroutine完成
-	var checkWg sync.WaitGroup
-
-	// 启动goroutine并行检查所有文档
-	// 为每个文档检查添加超时控制（10秒），避免单个文档检查时间过长导致整体超时
-	checkCtx, checkCancel := context.WithTimeout(ctx, 10*time.Second)
-	defer checkCancel()
-
-	for groupKey, group := range docGroupsMap {
-		checkWg.Add(1)
-		go func(key string, g *DocGroup) {
-			defer checkWg.Done()
-			defer func() {
-				if r := recover(); r != nil {
-					log.Printf("⚠️ 检查文档时发生panic: %v, 文档: %s", r, g.DocTitle)
-					// 发生panic时，设置默认值并继续
-					g.HasPublicForm = false
-				}
-			}()
-
-			// 使用带超时的context检查文档
-			done := make(chan bool, 1)
-			go func() {
-				defer func() {
-					if r := recover(); r != nil {
-						log.Printf("⚠️ checkPublicForm发生panic: %v, 文档: %s", r, g.DocTitle)
-						g.HasPublicForm = false
-					}
-					select {
-					case done <- true:
-					default:
-						// channel已满，说明已经发送过了
-					}
-				}()
-				checkPublicForm(g)
-			}()
-			
-			// 等待完成或超时
-			select {
-			case <-done:
-				// 检查完成
-				log.Printf("✅ 文档检查完成: %s", g.DocTitle)
-			case <-checkCtx.Done():
-				// 超时，设置默认值
-				log.Printf("⚠️ 文档检查超时: %s", g.DocTitle)
-				g.HasPublicForm = false
-			case <-time.After(8 * time.Second):
-				// 额外超时保护（8秒），避免无限等待
-				log.Printf("⚠️ 文档检查额外超时（8秒）: %s", g.DocTitle)
-				g.HasPublicForm = false
-			}
-
-			// 发送结果（使用select避免阻塞，添加超时）
-			select {
-			case checkChan <- checkResult{groupKey: key, group: g}:
-				log.Printf("✅ 文档检查结果已发送: %s", g.DocTitle)
-			case <-time.After(2 * time.Second):
-				// 发送超时，记录警告但继续（不会阻塞）
-				log.Printf("⚠️ 检查结果channel发送超时（2秒），跳过文档: %s", g.DocTitle)
-			default:
-				// channel已满，记录警告但继续（不会阻塞）
-				log.Printf("⚠️ 检查结果channel已满，跳过文档: %s", g.DocTitle)
-			}
-		}(groupKey, group)
-	}
-
-	// 设置收集结果的超时时间（5秒），确保不会无限等待
-	// 减少超时时间，避免长时间阻塞
-	collectCtx, collectCancel := context.WithTimeout(ctx, 5*time.Second)
-	defer collectCancel()
-
-	// 收集所有检查结果（带超时控制）
-	checkedGroups := make(map[string]*DocGroup, docGroupsCount)
-	collectDone := make(chan bool, 1)
 	
-	// 启动goroutine收集结果
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("⚠️ 收集结果时发生panic: %v", r)
-			}
-			select {
-			case collectDone <- true:
-			default:
-				// channel已满，说明已经发送过了
-			}
-		}()
-		for result := range checkChan {
-			checkedGroups[result.groupKey] = result.group
-			log.Printf("已收集文档检查结果: %s", result.group.DocTitle)
-		}
-		log.Printf("收集goroutine完成，共收集 %d 个结果", len(checkedGroups))
-	}()
-
-	// 等待所有检查完成，然后关闭channel
-	// 添加超时控制，避免某个检查goroutine卡住导致无限等待
-	closeDone := make(chan bool, 1)
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Printf("⚠️ 关闭channel时发生panic: %v", r)
-			}
-		}()
-		// 使用带超时的Wait，避免无限等待
-		waitDone := make(chan bool, 1)
-		go func() {
-			checkWg.Wait()
-			waitDone <- true
-		}()
+	// 异步检查：快速检查已完成的检查结果（非阻塞，等待足够时间确保检查完成）
+	// 平衡：既要避免502错误，又要确保检查完成
+	if len(checkTasks) > 0 {
+		// 使用map跟踪已处理的task，避免重复处理
+		processedTasks := make(map[*DocGroup]bool)
 		
-		select {
-		case <-waitDone:
-			log.Printf("所有检查goroutine已完成，关闭channel")
-			close(checkChan)
-			closeDone <- true
-		case <-time.After(5 * time.Second):
-			// 如果5秒内没有完成，强制关闭channel
-			log.Printf("⚠️ 等待检查goroutine完成超时（5秒），强制关闭channel，已收集 %d 个结果", len(checkedGroups))
-			close(checkChan)
-			closeDone <- true
+		// 先立即检查一次（可能检查已经完成）
+		completedCount := 0
+		for _, task := range checkTasks {
+			select {
+			case hasPublicForm := <-task.resultChan:
+				task.group.HasPublicForm = hasPublicForm
+				processedTasks[task.group] = true
+				completedCount++
+				if hasPublicForm {
+					log.Printf("✅ 文档 %s 检查完成，包含'公开形式'（不允许下载）", task.group.DocTitle)
+				} else {
+					log.Printf("✅ 文档 %s 检查完成，不包含'公开形式'（允许下载）", task.group.DocTitle)
+				}
+			default:
+				// 检查未完成，稍后处理
+			}
 		}
-	}()
-
-	// 等待收集完成或超时
-	log.Printf("等待文档检查结果收集完成... (超时时间: 5秒, 期望收集 %d 个结果)", docGroupsCount)
-	select {
-	case <-collectDone:
-		// 收集完成
-		log.Printf("✅ 文档检查结果收集完成，共收集 %d/%d 个结果", len(checkedGroups), docGroupsCount)
-	case <-collectCtx.Done():
-		// 超时，记录警告但继续处理已收集的结果
-		log.Printf("⚠️ 文档检查结果收集超时（5秒），已收集 %d/%d 个结果", len(checkedGroups), docGroupsCount)
-		// 确保collectDone channel不会阻塞（如果goroutine还在运行）
-		select {
-		case <-collectDone:
-			// goroutine已完成
-			log.Printf("收集goroutine在超时后完成")
-		case <-time.After(100 * time.Millisecond):
-			// 等待100ms，如果还没完成就继续
-			log.Printf("⚠️ 收集goroutine可能卡住，继续处理已收集的结果")
+		
+		// 如果还有未完成的检查，等待足够的时间（500ms，确保检查能完成）
+		if completedCount < len(checkTasks) {
+			maxWaitTime := 500 * time.Millisecond // 增加到500ms，确保检查完成
+			if len(checkTasks) > 10 {
+				maxWaitTime = 300 * time.Millisecond // 文档多时300ms
+			}
+			
+			log.Printf("等待 %d 个文档的检查结果（最多等待%v）...", len(checkTasks)-completedCount, maxWaitTime)
+			
+			// 使用带超时的select，非阻塞等待
+			timeout := time.NewTimer(maxWaitTime)
+			defer timeout.Stop()
+			
+			// 每50ms检查一次，直到超时或全部完成
+			ticker := time.NewTicker(50 * time.Millisecond)
+			defer ticker.Stop()
+			
+			waitLoop:
+			for completedCount < len(checkTasks) {
+				select {
+				case <-timeout.C:
+					// 超时，停止等待
+					log.Printf("等待超时，已收集 %d/%d 个检查结果", completedCount, len(checkTasks))
+					break waitLoop
+				case <-ticker.C:
+					// 检查是否有新的完成
+					for _, task := range checkTasks {
+						if processedTasks[task.group] {
+							continue // 已处理
+						}
+						select {
+						case hasPublicForm := <-task.resultChan:
+							task.group.HasPublicForm = hasPublicForm
+							processedTasks[task.group] = true
+							completedCount++
+							if hasPublicForm {
+								log.Printf("✅ 文档 %s 检查完成，包含'公开形式'（不允许下载）", task.group.DocTitle)
+							} else {
+								log.Printf("✅ 文档 %s 检查完成，不包含'公开形式'（允许下载）", task.group.DocTitle)
+							}
+						default:
+						}
+					}
+				}
+			}
 		}
+		
+		// 处理未完成的检查，使用更安全的默认值（不允许下载，更安全）
+		for _, task := range checkTasks {
+			if processedTasks[task.group] {
+				continue // 已处理
+			}
+			
+			// 尝试最后一次读取
+			select {
+			case hasPublicForm := <-task.resultChan:
+				task.group.HasPublicForm = hasPublicForm
+				processedTasks[task.group] = true
+				if hasPublicForm {
+					log.Printf("✅ 文档 %s 检查完成（最后读取），包含'公开形式'（不允许下载）", task.group.DocTitle)
+				} else {
+					log.Printf("✅ 文档 %s 检查完成（最后读取），不包含'公开形式'（允许下载）", task.group.DocTitle)
+				}
+			default:
+				// 检查未完成，使用更安全的默认值（不允许下载）
+				// 这样即使检查失败，也不会误允许下载包含"公开形式"的文档
+				task.group.HasPublicForm = true // 改为true，不允许下载（更安全）
+				log.Printf("⏳ 文档 %s 检查未完成，使用安全默认值：不允许下载（检查在后台继续）", task.group.DocTitle)
+			}
+		}
+		
+		log.Printf("检查结果收集完成，完成: %d/%d（异步检查，不阻塞主请求）", completedCount, len(checkTasks))
 	}
 	
-	// 等待channel关闭goroutine完成（最多等待1秒）
-	log.Printf("等待channel关闭goroutine完成...")
-	select {
-	case <-closeDone:
-		log.Printf("✅ channel关闭goroutine已完成")
-	case <-time.After(1 * time.Second):
-		log.Printf("⚠️ channel关闭goroutine超时，继续处理")
-	}
+	log.Printf("所有文档检查处理完成，立即返回响应")
 
-	// 如果有些文档没有收到结果（可能因为channel满了），使用原始group
-	if len(checkedGroups) < docGroupsCount {
-		log.Printf("⚠️ 警告：只收到 %d/%d 个文档的检查结果", len(checkedGroups), docGroupsCount)
-	}
-	
-	// 确保所有goroutine完成，避免在构建响应时出现问题
-	log.Printf("等待goroutine清理完成...")
-	// 等待checkWg完成，确保所有检查goroutine都已结束
-	done := make(chan bool, 1)
-	go func() {
-		checkWg.Wait()
-		done <- true
-	}()
-	
-	select {
-	case <-done:
-		log.Printf("✅ 所有检查goroutine已完成")
-	case <-time.After(2 * time.Second):
-		log.Printf("⚠️ 等待goroutine完成超时，继续处理")
-	}
-	
-	log.Printf("开始构建响应数据...")
-
-	// 按原始顺序添加到docGroups
-	log.Printf("开始构建响应数据，docGroupsMap数量: %d, checkedGroups数量: %d", len(docGroupsMap), len(checkedGroups))
+	// 按原始顺序添加到docGroups（完全异步，不等待检查结果）
+	log.Printf("开始构建响应数据，docGroupsMap数量: %d", len(docGroupsMap))
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("⚠️ 构建响应数据时发生panic: %v, 堆栈: %s", r, getStackTrace())
 		}
 	}()
 	
-	for groupKey, group := range docGroupsMap {
-		if checkedGroup, exists := checkedGroups[groupKey]; exists {
-			docGroups = append(docGroups, *checkedGroup)
-		} else {
-			// 如果检查失败，使用原始group
-			docGroups = append(docGroups, *group)
-		}
+	// 直接使用docGroupsMap构建响应（检查在后台异步进行）
+	for _, group := range docGroupsMap {
+		docGroups = append(docGroups, *group)
 	}
-	log.Printf("docGroups构建完成，共 %d 个文档组", len(docGroups))
+	log.Printf("docGroups构建完成，共 %d 个文档组（检查在后台异步进行）", len(docGroups))
 
 	// 构建响应数据
 	// 限制响应大小，避免内存溢出和502错误
@@ -1382,6 +1262,13 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// 设置响应头，确保即使编码失败也能正确返回
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	
+	// 提前发送响应头，避免502错误（在Ubuntu/Nginx环境下很重要）
+	// 这样即使后续处理出现问题，客户端也能知道请求已收到
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+		log.Printf("✅ 响应头已提前刷新，避免502错误")
+	}
 
 	// 检查context是否已取消（超时）
 	if ctx.Err() != nil {
@@ -1392,6 +1279,9 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusRequestTimeout)
 		fmt.Fprintf(w, `{"error":"请求超时","message":"处理时间过长，请求已超时"}`)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
 		return
 	}
 	
@@ -2143,25 +2033,44 @@ func (s *Server) startAsyncCheckWorkers() {
 	for i := 0; i < s.checkWorkers; i++ {
 		go func(workerID int) {
 			log.Printf("启动异步检查工作协程 #%d", workerID)
-			for group := range s.checkQueue {
+			for task := range s.checkQueue {
 				func() {
 					defer func() {
 						if r := recover(); r != nil {
-							log.Printf("⚠️ 异步检查工作协程 #%d 发生panic: %v, 文档: %s", workerID, r, group.DocTitle)
+							log.Printf("⚠️ 异步检查工作协程 #%d 发生panic: %v, 文档: %s", workerID, r, task.group.DocTitle)
+							// panic时发送默认结果（如果resultChan存在）
+							if task.resultChan != nil {
+								select {
+								case task.resultChan <- false:
+								default:
+								}
+							}
 						}
 					}()
 					
 					// 执行检查
-					log.Printf("[工作协程 #%d] 开始检查文档: %s (FileID: %s)", workerID, group.DocTitle, group.FileID)
-					s.checkPublicFormAsync(group)
+					log.Printf("[工作协程 #%d] 开始检查文档: %s (FileID: %s)", workerID, task.group.DocTitle, task.group.FileID)
+					s.checkPublicFormAsync(task.group)
 					
-					// 更新缓存
-					if group.FileID != "" {
-						s.publicFormCache.Store(group.FileID, group.HasPublicForm)
-						if group.HasPublicForm {
-							log.Printf("[工作协程 #%d] ✅ 文档 %s 检查完成，包含'公开形式'，已更新缓存", workerID, group.DocTitle)
+					// 发送结果（如果resultChan存在，完全异步模式下为nil）
+					if task.resultChan != nil {
+						select {
+						case task.resultChan <- task.group.HasPublicForm:
+							if task.group.HasPublicForm {
+								log.Printf("[工作协程 #%d] ✅ 文档 %s 检查完成，包含'公开形式'", workerID, task.group.DocTitle)
+							} else {
+								log.Printf("[工作协程 #%d] ✅ 文档 %s 检查完成，不包含'公开形式'", workerID, task.group.DocTitle)
+							}
+						default:
+							// channel已关闭或已满，记录警告
+							log.Printf("⚠️ [工作协程 #%d] 无法发送检查结果: %s", workerID, task.group.DocTitle)
+						}
+					} else {
+						// 完全异步模式，不发送结果，只记录日志
+						if task.group.HasPublicForm {
+							log.Printf("[工作协程 #%d] ✅ 文档 %s 异步检查完成，包含'公开形式'（完全异步模式）", workerID, task.group.DocTitle)
 						} else {
-							log.Printf("[工作协程 #%d] ✅ 文档 %s 检查完成，不包含'公开形式'，已更新缓存", workerID, group.DocTitle)
+							log.Printf("[工作协程 #%d] ✅ 文档 %s 异步检查完成，不包含'公开形式'（完全异步模式）", workerID, task.group.DocTitle)
 						}
 					}
 				}()
@@ -2172,9 +2081,9 @@ func (s *Server) startAsyncCheckWorkers() {
 	log.Printf("已启动 %d 个异步检查工作协程", s.checkWorkers)
 }
 
-// checkPublicFormAsync 异步检查文档是否包含"公开形式"（不阻塞主请求）
+// checkPublicFormSync 同步检查文档是否包含"公开形式"（实时检查，不使用缓存）
 // 只读取文档最后100个字符进行检查
-func (s *Server) checkPublicFormAsync(group *DocGroup) {
+func (s *Server) checkPublicFormSync(group *DocGroup) {
 	fileTypeLower := strings.ToLower(group.FileType)
 	if fileTypeLower != "pdf" && fileTypeLower != "doc" && fileTypeLower != "docx" && fileTypeLower != "txt" {
 		group.HasPublicForm = false
@@ -2207,18 +2116,20 @@ func (s *Server) checkPublicFormAsync(group *DocGroup) {
 		return
 	}
 
-	// 只读取最后100个字符进行检查
+	// 只读取最后100个字符进行检查（检查文档内容的最后一页）
 	const maxCheckLength = 100
 	var contentToCheck string
 
 	if fileTypeLower == "txt" {
+		// TXT文件：读取最后100字节
 		if fileContent, err := readFileLastBytes(filePath, maxCheckLength); err == nil {
 			contentToCheck = fileContent
-			log.Printf("[异步检查] TXT文件 %s 读取的最后100个字符: [%s]", group.DocTitle, contentToCheck)
+			log.Printf("[检查] TXT文件 %s 读取的最后%d个字符，实际长度: %d", group.DocTitle, maxCheckLength, len(contentToCheck))
 		} else {
-			log.Printf("[异步检查] TXT文件 %s 读取失败: %v", group.DocTitle, err)
+			log.Printf("[检查] TXT文件 %s 读取失败: %v", group.DocTitle, err)
 		}
 	} else if fileTypeLower == "pdf" || fileTypeLower == "doc" || fileTypeLower == "docx" {
+		// PDF/Word文档：加载最后一页的内容（最多100字符）
 		lastContent, err := loadDocumentLastPart(filePath, fileTypeLower, maxCheckLength)
 		if err == nil && lastContent != "" {
 			if len(lastContent) > maxCheckLength {
@@ -2226,29 +2137,26 @@ func (s *Server) checkPublicFormAsync(group *DocGroup) {
 			} else {
 				contentToCheck = lastContent
 			}
-			log.Printf("[异步检查] %s文件 %s 读取的最后100个字符: [%s]", strings.ToUpper(fileTypeLower), group.DocTitle, contentToCheck)
-			log.Printf("[异步检查] 原始内容长度: %d, 截取后长度: %d", len(lastContent), len(contentToCheck))
+			log.Printf("[检查] %s文件 %s 读取最后一页的最后%d个字符，实际长度: %d", strings.ToUpper(fileTypeLower), group.DocTitle, maxCheckLength, len(contentToCheck))
 		} else {
-			log.Printf("[异步检查] %s文件 %s 读取失败: %v", strings.ToUpper(fileTypeLower), group.DocTitle, err)
+			log.Printf("[检查] %s文件 %s 读取失败: %v", strings.ToUpper(fileTypeLower), group.DocTitle, err)
 		}
-	}
-
-	// 打印读取到的内容用于调试
-	if contentToCheck != "" {
-		log.Printf("[异步检查] 文档 %s (FileID: %s) 读取到的最后100个字符内容: [%s]", group.DocTitle, group.FileID, contentToCheck)
-		log.Printf("[异步检查] 内容长度: %d 字符", len(contentToCheck))
-		// 检查是否包含"公开形式"字符串
-		if strings.Contains(contentToCheck, "公开形式") {
-			log.Printf("[异步检查] ✅ 在内容中找到了'公开形式'字符串")
-		} else {
-			log.Printf("[异步检查] ❌ 在内容中未找到'公开形式'字符串")
-		}
-	} else {
-		log.Printf("[异步检查] ⚠️ 文档 %s 读取到的内容为空", group.DocTitle)
 	}
 
 	// 检查是否包含"公开形式"
 	hasPublicForm := checkPublicFormInContent(contentToCheck)
-	log.Printf("[异步检查] checkPublicFormInContent 返回结果: %v", hasPublicForm)
 	group.HasPublicForm = hasPublicForm
+	
+	// 记录检查结果，方便调试
+	if hasPublicForm {
+		log.Printf("[检查结果] ✅ 文档 %s 包含'公开形式'，不允许下载", group.DocTitle)
+	} else {
+		log.Printf("[检查结果] ✅ 文档 %s 不包含'公开形式'，允许下载", group.DocTitle)
+	}
+}
+
+// checkPublicFormAsync 异步检查文档是否包含"公开形式"（保留用于兼容，但不再使用）
+// 只读取文档最后100个字符进行检查
+func (s *Server) checkPublicFormAsync(group *DocGroup) {
+	s.checkPublicFormSync(group)
 }
