@@ -40,6 +40,17 @@ type FileInfo struct {
 	Chunks     int       `json:"chunks"`
 }
 
+// DocGroup 文档分组信息（用于查询结果和异步检查）
+type DocGroup struct {
+	DocTitle      string                   `json:"docTitle"`
+	DocSource     string                   `json:"docSource"`
+	SourceType    string                   `json:"sourceType"`              // "file" 或 "url"
+	FileType      string                   `json:"fileType,omitempty"`      // 文件类型，如 "pdf", "docx", "txt" 等
+	HasPublicForm bool                     `json:"hasPublicForm,omitempty"` // 是否包含"公开形式"字眼
+	FileID        string                   `json:"fileId,omitempty"`        // 文件ID，用于下载
+	Chunks        []map[string]interface{} `json:"chunks"`
+}
+
 // Server HTTP API服务器
 type Server struct {
 	ragSystem      *rag.RAG
@@ -52,6 +63,11 @@ type Server struct {
 	failedFilesDir string               // 失败文件目录
 	files          map[string]*FileInfo // 文件ID -> 文件信息
 	db             *sql.DB              // MySQL 连接（用于业务数据，如意见反馈）
+	
+	// 异步检查相关
+	checkQueue     chan *DocGroup        // 检查任务队列
+	publicFormCache sync.Map             // 缓存检查结果：fileID -> bool
+	checkWorkers   int                   // 检查工作协程数量
 }
 
 // NewServer 创建新的API服务器
@@ -133,7 +149,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	// 获取管理员token（从环境变量或配置）
 	adminToken := os.Getenv("ADMIN_TOKEN")
 	if adminToken == "" {
-		adminToken = "admin123" // 默认token，生产环境应该使用强密码
+		adminToken = "Zhzx@666" // 默认token，生产环境应该使用强密码
 		log.Println("警告: 使用默认管理员token，建议设置 ADMIN_TOKEN 环境变量")
 	}
 
@@ -160,10 +176,15 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		failedFilesDir: failedFilesDir,
 		files:          make(map[string]*FileInfo),
 		db:             db,
+		checkQueue:     make(chan *DocGroup, 100), // 检查任务队列，缓冲区100
+		checkWorkers:   3,                         // 3个工作协程处理检查任务
 	}
 
 	// 从磁盘恢复文件列表
 	server.loadFilesFromDisk()
+
+	// 启动异步检查工作协程
+	server.startAsyncCheckWorkers()
 
 	return server, nil
 }
@@ -755,6 +776,22 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 
 // handleQuery 处理查询请求
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
+	// 添加panic恢复，确保即使发生panic也不会导致服务崩溃
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("⚠️ handleQuery发生panic: %v, 堆栈: %s", r, getStackTrace())
+			// 尝试返回错误响应
+			if w.Header().Get("Content-Type") == "" {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"error":   "服务器内部错误",
+					"message": "查询处理时发生意外错误",
+				})
+			}
+		}
+	}()
+	
 	// 提前设置响应头，确保即使发生错误也能正确返回
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
@@ -799,12 +836,24 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("收到查询请求: %s (topK=%d), 客户端: %s", req.Question, req.TopK, r.RemoteAddr)
 
-	// 优化：使用请求的context，并添加超时控制（60秒），确保请求可以取消
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	// 优化：使用请求的context，并添加超时控制（50秒），确保请求可以取消
+	// 减少超时时间，避免LLM调用时间过长导致服务被停止
+	ctx, cancel := context.WithTimeout(r.Context(), 50*time.Second)
 	defer cancel()
 
 	// 使用 QueryWithResults 方法，避免重复搜索
-	queryResult, err := tempRAG.QueryWithResults(ctx, req.Question)
+	// 添加panic恢复，确保LLM调用失败不会导致服务崩溃
+	var queryResult *rag.QueryResult
+	var err error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("⚠️ QueryWithResults发生panic: %v, 堆栈: %s", r, getStackTrace())
+				err = fmt.Errorf("查询处理时发生panic: %v", r)
+			}
+		}()
+		queryResult, err = tempRAG.QueryWithResults(ctx, req.Question)
+	}()
 	if err != nil {
 		log.Printf("查询失败 - 问题: %s, 错误: %v, 错误类型: %T, 客户端: %s", req.Question, err, err, r.RemoteAddr)
 		// 返回更详细的错误信息
@@ -824,15 +873,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	// 按文档来源分组，只返回被标注使用的文档片段
 	// 使用 map 来按文档来源分组
-	type DocGroup struct {
-		DocTitle      string                   `json:"docTitle"`
-		DocSource     string                   `json:"docSource"`
-		SourceType    string                   `json:"sourceType"`              // "file" 或 "url"
-		FileType      string                   `json:"fileType,omitempty"`      // 文件类型，如 "pdf", "docx", "txt" 等
-		HasPublicForm bool                     `json:"hasPublicForm,omitempty"` // 是否包含"公开形式"字眼
-		FileID        string                   `json:"fileId,omitempty"`        // 文件ID，用于下载
-		Chunks        []map[string]interface{} `json:"chunks"`
-	}
+	// DocGroup 类型已在包级别定义
 
 	// 优化：使用sync.Map和并发处理文档分组，提升性能
 	type docProcessResult struct {
@@ -1014,134 +1055,55 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// 先检查返回的chunks内容，收集所有内容
-		// 限制总大小，避免内存溢出（最多收集100KB的内容）
-		const maxContentSize = 100 * 1024 // 100KB
-		allContent := strings.Builder{}
-		allContent.Grow(2000) // 预分配2KB
-		totalSize := 0
-		
-		for _, chunk := range group.Chunks {
-			if totalSize >= maxContentSize {
-				break // 达到限制，停止收集
+		// 先检查缓存中是否有结果
+		if group.FileID != "" {
+			if cached, ok := s.publicFormCache.Load(group.FileID); ok {
+				hasPublicForm := cached.(bool)
+				if hasPublicForm {
+					log.Printf("✅ 从缓存获取：文档 %s 包含'公开形式'", group.DocTitle)
+				} else {
+					log.Printf("✅ 从缓存获取：文档 %s 不包含'公开形式'", group.DocTitle)
+				}
+				group.HasPublicForm = hasPublicForm
+				return
+			}
+		}
+
+		// 直接读取文档的最后100个字符进行检查（不从chunks中读取）
+		// 将任务放入异步检查队列，并等待一小段时间看是否能快速完成
+		if group.FileID != "" {
+			// 先放入队列
+			select {
+			case s.checkQueue <- group:
+				log.Printf("📋 文档 %s 已加入异步检查队列（直接读取文件最后100个字符）", group.DocTitle)
+			default:
+				// 队列已满，记录警告但继续（不阻塞）
+				log.Printf("⚠️ 检查队列已满，跳过异步检查: %s", group.DocTitle)
+				group.HasPublicForm = false
+				return
 			}
 			
-			// 尝试多个可能的字段名
-			var content string
-			if c, ok := chunk["content"].(string); ok && c != "" {
-				content = c
-			} else if c, ok = chunk["pageContent"].(string); ok && c != "" {
-				content = c
-			} else if c, ok = chunk["preview"].(string); ok && c != "" {
-				content = c
-			}
+			// 等待一小段时间（500ms），看异步检查是否能快速完成
+			// 这样可以避免第一次查询时总是允许下载
+			time.Sleep(500 * time.Millisecond)
 			
-			if content != "" {
-				// 如果加上这个内容会超过限制，只取部分
-				if totalSize+len(content) > maxContentSize {
-					remaining := maxContentSize - totalSize
-					if remaining > 0 {
-						allContent.WriteString(content[:remaining])
-						totalSize = maxContentSize
-					}
-					break
+			// 再次检查缓存，看异步检查是否已完成
+			if cached, ok := s.publicFormCache.Load(group.FileID); ok {
+				hasPublicForm := cached.(bool)
+				if hasPublicForm {
+					log.Printf("✅ 等待后从缓存获取：文档 %s 包含'公开形式'", group.DocTitle)
+				} else {
+					log.Printf("✅ 等待后从缓存获取：文档 %s 不包含'公开形式'", group.DocTitle)
 				}
-				allContent.WriteString(content)
-				allContent.WriteString("\n")
-				totalSize += len(content) + 1
-			}
-		}
-
-		// 如果文件信息中有内容预览，也加入检查（但不超过限制）
-		if group.FileID != "" && totalSize < maxContentSize {
-			if fileInfo, exists := s.files[group.FileID]; exists && fileInfo.Content != "" {
-				preview := fileInfo.Content
-				remaining := maxContentSize - totalSize
-				if len(preview) > remaining {
-					preview = preview[:remaining]
-				}
-				allContent.WriteString(preview)
-				allContent.WriteString("\n")
-				totalSize += len(preview) + 1
-			}
-		}
-
-		allContentStr := allContent.String()
-		// 只检查文档内容的最后部分（最后2000个字符）
-		// 因为"公开形式"通常在文档末尾
-		contentToCheck := allContentStr
-		if len(contentToCheck) > 2000 {
-			contentToCheck = contentToCheck[len(contentToCheck)-2000:]
-		}
-
-		log.Printf("检查文档 %s (类型: %s, FileID: %s) 最后部分是否包含'公开形式'，检查内容长度: %d (总长度: %d)", group.DocTitle, group.FileType, group.FileID, len(contentToCheck), len(allContentStr))
-
-		// 如果chunks中没有找到，尝试重新加载文档并检查最后部分
-		if len(contentToCheck) == 0 || !checkPublicFormInContent(contentToCheck) {
-			if group.FileID != "" {
-				if fileInfo, exists := s.files[group.FileID]; exists {
-					// 构建文件路径
-					var filePath string
-					newFormatPath := filepath.Join(s.filesDir, group.FileID+"_"+fileInfo.Filename)
-					oldFormatPath := filepath.Join(s.filesDir, group.FileID+filepath.Ext(fileInfo.Filename))
-
-					// 优先尝试新格式
-					if _, err := os.Stat(newFormatPath); err == nil {
-						filePath = newFormatPath
-					} else if _, err := os.Stat(oldFormatPath); err == nil {
-						filePath = oldFormatPath
-					}
-
-					if filePath != "" {
-						// 对于TXT文件，直接读取文件的最后部分
-						if fileTypeLower == "txt" {
-							if fileContent, err := readFileLastBytes(filePath, 2000); err == nil {
-								contentToCheck = fileContent
-								log.Printf("从TXT文件读取最后部分，长度: %d", len(contentToCheck))
-							}
-						} else if fileTypeLower == "pdf" || fileTypeLower == "doc" || fileTypeLower == "docx" {
-							// 对于PDF和Word文件，只加载文档的最后部分
-							lastContent, err := loadDocumentLastPart(filePath, fileTypeLower)
-							if err == nil && lastContent != "" {
-								// 只检查最后2000个字符
-								if len(lastContent) > 2000 {
-									contentToCheck = lastContent[len(lastContent)-2000:]
-								} else {
-									contentToCheck = lastContent
-								}
-								log.Printf("加载文档最后部分并检查，检查内容长度: %d (总长度: %d)", len(contentToCheck), len(lastContent))
-							} else {
-								log.Printf("加载文档最后部分失败: %v", err)
-							}
-						}
-					}
-				}
-			}
-		}
-
-		// 检查最后部分是否包含"公开形式"
-		hasPublicForm := checkPublicFormInContent(contentToCheck)
-
-		if hasPublicForm {
-			group.HasPublicForm = true
-			log.Printf("✅ 检测到文档 %s (类型: %s, FileID: %s) 最后部分包含'公开形式' - 将禁止下载", group.DocTitle, group.FileType, group.FileID)
-			// 输出检测到的具体内容片段用于确认
-			idx := strings.Index(contentToCheck, "公开形式")
-			if idx >= 0 {
-				start := idx - 20
-				if start < 0 {
-					start = 0
-				}
-				end := idx + 50
-				if end > len(contentToCheck) {
-					end = len(contentToCheck)
-				}
-				log.Printf("检测到的内容片段: ...%s...", contentToCheck[start:end])
+				group.HasPublicForm = hasPublicForm
+			} else {
+				// 如果还没完成，先允许下载（异步检查会更新缓存，下次查询时会使用）
+				log.Printf("⏳ 文档 %s 异步检查尚未完成，先允许下载（下次查询时会使用缓存结果）", group.DocTitle)
+				group.HasPublicForm = false
 			}
 		} else {
-			// 明确设置为false，确保JSON序列化时包含该字段
+			// 没有FileID，无法检查，默认允许下载
 			group.HasPublicForm = false
-			log.Printf("❌ 文档 %s (类型: %s, FileID: %s) 最后部分未检测到'公开形式' - 允许下载", group.DocTitle, group.FileType, group.FileID)
 		}
 	}
 
@@ -1150,7 +1112,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		groupKey string // 使用docSource作为唯一标识
 		group    *DocGroup
 	}
-	
+
 	// 限制channel缓冲区大小，避免内存问题
 	docGroupsCount := len(docGroupsMap)
 	const maxCheckBuffer = 100
@@ -1162,12 +1124,12 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	// 使用WaitGroup确保所有goroutine完成
 	var checkWg sync.WaitGroup
-	
+
 	// 启动goroutine并行检查所有文档
 	// 为每个文档检查添加超时控制（10秒），避免单个文档检查时间过长导致整体超时
 	checkCtx, checkCancel := context.WithTimeout(ctx, 10*time.Second)
 	defer checkCancel()
-	
+
 	for groupKey, group := range docGroupsMap {
 		checkWg.Add(1)
 		go func(key string, g *DocGroup) {
@@ -1179,27 +1141,46 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 					g.HasPublicForm = false
 				}
 			}()
-			
+
 			// 使用带超时的context检查文档
 			done := make(chan bool, 1)
 			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("⚠️ checkPublicForm发生panic: %v, 文档: %s", r, g.DocTitle)
+						g.HasPublicForm = false
+					}
+					select {
+					case done <- true:
+					default:
+						// channel已满，说明已经发送过了
+					}
+				}()
 				checkPublicForm(g)
-				done <- true
 			}()
 			
 			// 等待完成或超时
 			select {
 			case <-done:
 				// 检查完成
+				log.Printf("✅ 文档检查完成: %s", g.DocTitle)
 			case <-checkCtx.Done():
 				// 超时，设置默认值
 				log.Printf("⚠️ 文档检查超时: %s", g.DocTitle)
 				g.HasPublicForm = false
+			case <-time.After(8 * time.Second):
+				// 额外超时保护（8秒），避免无限等待
+				log.Printf("⚠️ 文档检查额外超时（8秒）: %s", g.DocTitle)
+				g.HasPublicForm = false
 			}
-			
-			// 发送结果（使用select避免阻塞）
+
+			// 发送结果（使用select避免阻塞，添加超时）
 			select {
 			case checkChan <- checkResult{groupKey: key, group: g}:
+				log.Printf("✅ 文档检查结果已发送: %s", g.DocTitle)
+			case <-time.After(2 * time.Second):
+				// 发送超时，记录警告但继续（不会阻塞）
+				log.Printf("⚠️ 检查结果channel发送超时（2秒），跳过文档: %s", g.DocTitle)
 			default:
 				// channel已满，记录警告但继续（不会阻塞）
 				log.Printf("⚠️ 检查结果channel已满，跳过文档: %s", g.DocTitle)
@@ -1207,42 +1188,123 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}(groupKey, group)
 	}
 
-	// 等待所有检查完成，然后关闭channel
-	go func() {
-		checkWg.Wait()
-		close(checkChan)
-	}()
-	
-	// 设置收集结果的超时时间（15秒），确保不会无限等待
-	collectCtx, collectCancel := context.WithTimeout(ctx, 15*time.Second)
+	// 设置收集结果的超时时间（5秒），确保不会无限等待
+	// 减少超时时间，避免长时间阻塞
+	collectCtx, collectCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer collectCancel()
-	
+
 	// 收集所有检查结果（带超时控制）
 	checkedGroups := make(map[string]*DocGroup, docGroupsCount)
 	collectDone := make(chan bool, 1)
 	
+	// 启动goroutine收集结果
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("⚠️ 收集结果时发生panic: %v", r)
+			}
+			select {
+			case collectDone <- true:
+			default:
+				// channel已满，说明已经发送过了
+			}
+		}()
 		for result := range checkChan {
 			checkedGroups[result.groupKey] = result.group
+			log.Printf("已收集文档检查结果: %s", result.group.DocTitle)
 		}
-		collectDone <- true
+		log.Printf("收集goroutine完成，共收集 %d 个结果", len(checkedGroups))
 	}()
-	
+
+	// 等待所有检查完成，然后关闭channel
+	// 添加超时控制，避免某个检查goroutine卡住导致无限等待
+	closeDone := make(chan bool, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("⚠️ 关闭channel时发生panic: %v", r)
+			}
+		}()
+		// 使用带超时的Wait，避免无限等待
+		waitDone := make(chan bool, 1)
+		go func() {
+			checkWg.Wait()
+			waitDone <- true
+		}()
+		
+		select {
+		case <-waitDone:
+			log.Printf("所有检查goroutine已完成，关闭channel")
+			close(checkChan)
+			closeDone <- true
+		case <-time.After(5 * time.Second):
+			// 如果5秒内没有完成，强制关闭channel
+			log.Printf("⚠️ 等待检查goroutine完成超时（5秒），强制关闭channel，已收集 %d 个结果", len(checkedGroups))
+			close(checkChan)
+			closeDone <- true
+		}
+	}()
+
 	// 等待收集完成或超时
+	log.Printf("等待文档检查结果收集完成... (超时时间: 5秒, 期望收集 %d 个结果)", docGroupsCount)
 	select {
 	case <-collectDone:
 		// 收集完成
+		log.Printf("✅ 文档检查结果收集完成，共收集 %d/%d 个结果", len(checkedGroups), docGroupsCount)
 	case <-collectCtx.Done():
 		// 超时，记录警告但继续处理已收集的结果
-		log.Printf("⚠️ 文档检查结果收集超时，已收集 %d/%d 个结果", len(checkedGroups), docGroupsCount)
+		log.Printf("⚠️ 文档检查结果收集超时（5秒），已收集 %d/%d 个结果", len(checkedGroups), docGroupsCount)
+		// 确保collectDone channel不会阻塞（如果goroutine还在运行）
+		select {
+		case <-collectDone:
+			// goroutine已完成
+			log.Printf("收集goroutine在超时后完成")
+		case <-time.After(100 * time.Millisecond):
+			// 等待100ms，如果还没完成就继续
+			log.Printf("⚠️ 收集goroutine可能卡住，继续处理已收集的结果")
+		}
 	}
 	
+	// 等待channel关闭goroutine完成（最多等待1秒）
+	log.Printf("等待channel关闭goroutine完成...")
+	select {
+	case <-closeDone:
+		log.Printf("✅ channel关闭goroutine已完成")
+	case <-time.After(1 * time.Second):
+		log.Printf("⚠️ channel关闭goroutine超时，继续处理")
+	}
+
 	// 如果有些文档没有收到结果（可能因为channel满了），使用原始group
 	if len(checkedGroups) < docGroupsCount {
 		log.Printf("⚠️ 警告：只收到 %d/%d 个文档的检查结果", len(checkedGroups), docGroupsCount)
 	}
+	
+	// 确保所有goroutine完成，避免在构建响应时出现问题
+	log.Printf("等待goroutine清理完成...")
+	// 等待checkWg完成，确保所有检查goroutine都已结束
+	done := make(chan bool, 1)
+	go func() {
+		checkWg.Wait()
+		done <- true
+	}()
+	
+	select {
+	case <-done:
+		log.Printf("✅ 所有检查goroutine已完成")
+	case <-time.After(2 * time.Second):
+		log.Printf("⚠️ 等待goroutine完成超时，继续处理")
+	}
+	
+	log.Printf("开始构建响应数据...")
 
 	// 按原始顺序添加到docGroups
+	log.Printf("开始构建响应数据，docGroupsMap数量: %d, checkedGroups数量: %d", len(docGroupsMap), len(checkedGroups))
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("⚠️ 构建响应数据时发生panic: %v, 堆栈: %s", r, getStackTrace())
+		}
+	}()
+	
 	for groupKey, group := range docGroupsMap {
 		if checkedGroup, exists := checkedGroups[groupKey]; exists {
 			docGroups = append(docGroups, *checkedGroup)
@@ -1251,121 +1313,214 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			docGroups = append(docGroups, *group)
 		}
 	}
+	log.Printf("docGroups构建完成，共 %d 个文档组", len(docGroups))
 
 	// 构建响应数据
-	response := map[string]interface{}{
-		"answer":    queryResult.Answer,
-		"results":   searchResults, // 平铺格式（兼容旧前端）
-		"docGroups": docGroups,     // 按文档分组的格式（新格式）
+	// 限制响应大小，避免内存溢出和502错误
+	// 如果docGroups太大，只返回前50个
+	const maxDocGroups = 50
+	limitedDocGroups := docGroups
+	if len(docGroups) > maxDocGroups {
+		log.Printf("⚠️ 文档组数量过多 (%d > %d)，只返回前 %d 个", len(docGroups), maxDocGroups, maxDocGroups)
+		limitedDocGroups = docGroups[:maxDocGroups]
 	}
+	
+	// 限制每个文档组的chunks数量，避免响应过大
+	// 同时限制每个chunk的内容长度，避免单个chunk过大
+	const maxChunksPerGroup = 20
+	const maxChunkContentLength = 2000 // 每个chunk最多2000字符
+	
+	totalChunksBefore := 0
+	for i := range limitedDocGroups {
+		totalChunksBefore += len(limitedDocGroups[i].Chunks)
+		
+		// 限制chunks数量
+		if len(limitedDocGroups[i].Chunks) > maxChunksPerGroup {
+			log.Printf("⚠️ 文档 %s 的chunks数量过多 (%d > %d)，只返回前 %d 个", limitedDocGroups[i].DocTitle, len(limitedDocGroups[i].Chunks), maxChunksPerGroup, maxChunksPerGroup)
+			limitedDocGroups[i].Chunks = limitedDocGroups[i].Chunks[:maxChunksPerGroup]
+		}
+		
+		// 限制每个chunk的内容长度
+		for j := range limitedDocGroups[i].Chunks {
+			chunk := limitedDocGroups[i].Chunks[j]
+			if content, ok := chunk["content"].(string); ok && len(content) > maxChunkContentLength {
+				chunk["content"] = content[:maxChunkContentLength] + "..."
+			}
+			if pageContent, ok := chunk["pageContent"].(string); ok && len(pageContent) > maxChunkContentLength {
+				chunk["pageContent"] = pageContent[:maxChunkContentLength] + "..."
+			}
+		}
+	}
+	totalChunksAfter := 0
+	for _, g := range limitedDocGroups {
+		totalChunksAfter += len(g.Chunks)
+	}
+	log.Printf("响应数据限制完成，文档组数: %d, 总chunks数: %d -> %d", len(limitedDocGroups), totalChunksBefore, totalChunksAfter)
+	
+	// 构建响应数据，添加错误处理
+	var response map[string]interface{}
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("⚠️ 构建response map时发生panic: %v, 堆栈: %s", r, getStackTrace())
+				// 使用简化的响应
+				response = map[string]interface{}{
+					"answer":    queryResult.Answer,
+					"results":   []map[string]interface{}{}, // 空结果
+					"docGroups": []DocGroup{},               // 空文档组
+				}
+			}
+		}()
+		response = map[string]interface{}{
+			"answer":    queryResult.Answer,
+			"results":   searchResults, // 平铺格式（兼容旧前端）
+			"docGroups": limitedDocGroups,     // 按文档分组的格式（新格式）
+		}
+	}()
+	log.Printf("响应数据构建完成，准备编码JSON，answer长度: %d, results数量: %d, docGroups数量: %d", len(queryResult.Answer), len(searchResults), len(limitedDocGroups))
 
 	// 设置响应头，确保即使编码失败也能正确返回
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 
+	// 检查context是否已取消（超时）
+	if ctx.Err() != nil {
+		log.Printf("⚠️ 请求context已取消: %v, 问题: %s", ctx.Err(), req.Question)
+		// 如果context已取消，尝试返回错误响应
+		if w.Header().Get("Content-Type") == "" {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		}
+		w.WriteHeader(http.StatusRequestTimeout)
+		fmt.Fprintf(w, `{"error":"请求超时","message":"处理时间过长，请求已超时"}`)
+		return
+	}
+	
+	// 记录响应大小，用于监控
+	responseSize := len(queryResult.Answer) + len(limitedDocGroups)*100 // 粗略估算
+	log.Printf("准备发送响应，答案长度: %d 字符, 文档组数: %d, 估算响应大小: %d 字节", len(queryResult.Answer), len(limitedDocGroups), responseSize)
+	
+	// 检查客户端连接是否已关闭
+	if r.Context().Err() != nil {
+		log.Printf("⚠️ 客户端连接已关闭: %v, 问题: %s", r.Context().Err(), req.Question)
+		return
+	}
+	
 	// 编码响应，确保错误处理
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		log.Printf("编码查询响应失败: %v, 问题: %s", err, req.Question)
+	// 使用缓冲写入，避免大响应导致问题
+	log.Printf("开始编码JSON响应...")
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("⚠️ 编码响应时发生panic: %v, 堆栈: %s", r, getStackTrace())
+			// 尝试返回错误响应
+			if w.Header().Get("Content-Type") == "" {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, `{"error":"响应编码失败","message":"服务器处理响应时出错"}`)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+	}()
+	
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "") // 不格式化，减少响应大小
+	
+	if err := encoder.Encode(response); err != nil {
+		log.Printf("⚠️ 编码查询响应失败: %v, 问题: %s, 错误类型: %T", err, req.Question, err)
 		// 如果编码失败，尝试返回一个简单的错误响应
 		// 注意：此时响应头可能已经部分写入，但这是最后的尝试
 		if w.Header().Get("Content-Type") == "" {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		}
+		// 检查是否已经写入状态码（避免重复写入）
 		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprintf(w, `{"error":"响应编码失败"}`)
+		fmt.Fprintf(w, `{"error":"响应编码失败","message":"服务器处理响应时出错"}`)
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
 		return
 	}
+	
+	log.Printf("JSON编码完成，准备刷新响应...")
+	
+	// 尝试刷新响应（如果支持），确保数据及时发送，避免超时导致502
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+		log.Printf("✅ 响应已刷新，确保数据及时发送")
+	}
 
-	log.Printf("查询响应已成功发送，答案长度: %d 字符, 文档组数: %d", len(queryResult.Answer), len(docGroups))
+	log.Printf("✅ 查询响应已成功发送，答案长度: %d 字符, 文档组数: %d", len(queryResult.Answer), len(limitedDocGroups))
 }
 
-// loadDocumentLastPart 加载PDF或Word文档的最后部分（只加载最后几页/最后部分内容）
-// 避免加载整个文档，节省内存
-// 添加超时控制，避免大文件加载时间过长
-func loadDocumentLastPart(filePath string, fileType string) (string, error) {
-	// 创建带超时的context（5秒），避免大文件加载时间过长
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+// loadDocumentLastPart 加载PDF或Word文档的最后部分（只加载最后几个字符）
+// 避免加载整个文档，节省内存和CPU
+// 注意：虽然我们只保留最后几个字符，但底层的fileLoader.Load()仍会解析整个文档
+// 这是PDF/Word解析库的限制，无法避免。但我们已经限制了内存使用
+// maxChars: 最多加载的字符数（默认100）
+func loadDocumentLastPart(filePath string, fileType string, maxChars int) (string, error) {
+	if maxChars <= 0 {
+		maxChars = 100 // 默认只加载最后100个字符
+	}
 	
+	// 创建带超时的context（1.5秒），避免大文件加载时间过长
+	// 进一步减少超时时间，最小化CPU占用
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+
 	// 在goroutine中加载文档，以便可以超时取消
 	type loadResult struct {
 		docs []schema.Document
 		err  error
 	}
 	resultChan := make(chan loadResult, 1)
-	
+
+	// 使用goroutine加载，避免阻塞
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("⚠️ loadDocumentLastPart加载文档时发生panic: %v", r)
+				resultChan <- loadResult{err: fmt.Errorf("加载文档时发生panic: %v", r)}
+			}
+		}()
 		fileLoader := loader.NewFileLoader()
 		docs, err := fileLoader.Load(filePath)
 		resultChan <- loadResult{docs: docs, err: err}
 	}()
-	
+
 	var docs []schema.Document
 	var err error
-	
+
 	select {
 	case result := <-resultChan:
 		docs = result.docs
 		err = result.err
 	case <-ctx.Done():
-		return "", fmt.Errorf("加载文档超时（超过5秒）")
+		// 超时，返回错误，避免继续占用内存和CPU
+		log.Printf("⚠️ 加载文档超时（超过1.5秒）: %s", filePath)
+		return "", fmt.Errorf("加载文档超时（超过1.5秒）")
 	}
-	
+
 	if err != nil {
 		return "", fmt.Errorf("加载文档失败: %w", err)
 	}
-	
+
 	if len(docs) == 0 {
 		return "", fmt.Errorf("文档为空")
 	}
-	
-	// 对于PDF，通常每个文档代表一页，我们只取最后几页
+
+	// 只取最后一页/最后一个文档的最后部分
+	// 对于PDF，通常每个文档代表一页，我们只取最后一页
 	// 对于Word，通常只有一个文档，我们只取最后部分
-	const maxPagesToLoad = 2        // 最多加载最后2页
-	const maxContentSize = 500 * 1024 // 最多500KB内容
-	
-	var lastContent strings.Builder
-	lastContent.Grow(2000) // 预分配2KB
-	
-	totalSize := 0
-	
-	// 从后往前收集内容
-	startIdx := 0
-	if len(docs) > maxPagesToLoad {
-		startIdx = len(docs) - maxPagesToLoad
+	lastDoc := docs[len(docs)-1]
+	content := lastDoc.PageContent
+
+	// 只取最后maxChars个字符
+	if len(content) > maxChars {
+		content = content[len(content)-maxChars:]
 	}
-	
-	// 为了保持顺序（从后往前），我们需要先收集，然后反转
-	// 但为了简单，我们直接收集最后几页的内容
-	for i := startIdx; i < len(docs) && totalSize < maxContentSize; i++ {
-		content := docs[i].PageContent
-		
-		// 如果加上这个内容会超过限制，只取部分
-		if totalSize+len(content) > maxContentSize {
-			remaining := maxContentSize - totalSize
-			if remaining > 0 {
-				// 对于最后一页，只取内容的最后部分
-				if i == len(docs)-1 {
-					contentStart := len(content) - remaining
-					if contentStart < 0 {
-						contentStart = 0
-					}
-					lastContent.WriteString(content[contentStart:])
-				} else {
-					// 对于前面的页，跳过
-					break
-				}
-			}
-			totalSize = maxContentSize
-			break
-		}
-		
-		lastContent.WriteString(content)
-		lastContent.WriteString("\n")
-		totalSize += len(content) + 1
-	}
-	
-	return lastContent.String(), nil
+
+	return content, nil
 }
 
 // readFileLastBytes 读取文件的最后N个字节（尝试按UTF-8解码）
@@ -1980,4 +2135,120 @@ func getStackTrace() string {
 	buf := make([]byte, 4096)
 	n := runtime.Stack(buf, false)
 	return string(buf[:n])
+}
+
+// startAsyncCheckWorkers 启动异步检查工作协程
+// 这些协程会从队列中取出文档检查任务，在后台异步执行
+func (s *Server) startAsyncCheckWorkers() {
+	for i := 0; i < s.checkWorkers; i++ {
+		go func(workerID int) {
+			log.Printf("启动异步检查工作协程 #%d", workerID)
+			for group := range s.checkQueue {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("⚠️ 异步检查工作协程 #%d 发生panic: %v, 文档: %s", workerID, r, group.DocTitle)
+						}
+					}()
+					
+					// 执行检查
+					log.Printf("[工作协程 #%d] 开始检查文档: %s (FileID: %s)", workerID, group.DocTitle, group.FileID)
+					s.checkPublicFormAsync(group)
+					
+					// 更新缓存
+					if group.FileID != "" {
+						s.publicFormCache.Store(group.FileID, group.HasPublicForm)
+						if group.HasPublicForm {
+							log.Printf("[工作协程 #%d] ✅ 文档 %s 检查完成，包含'公开形式'，已更新缓存", workerID, group.DocTitle)
+						} else {
+							log.Printf("[工作协程 #%d] ✅ 文档 %s 检查完成，不包含'公开形式'，已更新缓存", workerID, group.DocTitle)
+						}
+					}
+				}()
+			}
+			log.Printf("异步检查工作协程 #%d 已退出", workerID)
+		}(i)
+	}
+	log.Printf("已启动 %d 个异步检查工作协程", s.checkWorkers)
+}
+
+// checkPublicFormAsync 异步检查文档是否包含"公开形式"（不阻塞主请求）
+// 只读取文档最后100个字符进行检查
+func (s *Server) checkPublicFormAsync(group *DocGroup) {
+	fileTypeLower := strings.ToLower(group.FileType)
+	if fileTypeLower != "pdf" && fileTypeLower != "doc" && fileTypeLower != "docx" && fileTypeLower != "txt" {
+		group.HasPublicForm = false
+		return
+	}
+
+	// 检查文件路径
+	if group.FileID == "" {
+		group.HasPublicForm = false
+		return
+	}
+
+	fileInfo, exists := s.files[group.FileID]
+	if !exists {
+		group.HasPublicForm = false
+		return
+	}
+
+	// 构建文件路径
+	var filePath string
+	newFormatPath := filepath.Join(s.filesDir, group.FileID+"_"+fileInfo.Filename)
+	oldFormatPath := filepath.Join(s.filesDir, group.FileID+filepath.Ext(fileInfo.Filename))
+
+	if _, err := os.Stat(newFormatPath); err == nil {
+		filePath = newFormatPath
+	} else if _, err := os.Stat(oldFormatPath); err == nil {
+		filePath = oldFormatPath
+	} else {
+		group.HasPublicForm = false
+		return
+	}
+
+	// 只读取最后100个字符进行检查
+	const maxCheckLength = 100
+	var contentToCheck string
+
+	if fileTypeLower == "txt" {
+		if fileContent, err := readFileLastBytes(filePath, maxCheckLength); err == nil {
+			contentToCheck = fileContent
+			log.Printf("[异步检查] TXT文件 %s 读取的最后100个字符: [%s]", group.DocTitle, contentToCheck)
+		} else {
+			log.Printf("[异步检查] TXT文件 %s 读取失败: %v", group.DocTitle, err)
+		}
+	} else if fileTypeLower == "pdf" || fileTypeLower == "doc" || fileTypeLower == "docx" {
+		lastContent, err := loadDocumentLastPart(filePath, fileTypeLower, maxCheckLength)
+		if err == nil && lastContent != "" {
+			if len(lastContent) > maxCheckLength {
+				contentToCheck = lastContent[len(lastContent)-maxCheckLength:]
+			} else {
+				contentToCheck = lastContent
+			}
+			log.Printf("[异步检查] %s文件 %s 读取的最后100个字符: [%s]", strings.ToUpper(fileTypeLower), group.DocTitle, contentToCheck)
+			log.Printf("[异步检查] 原始内容长度: %d, 截取后长度: %d", len(lastContent), len(contentToCheck))
+		} else {
+			log.Printf("[异步检查] %s文件 %s 读取失败: %v", strings.ToUpper(fileTypeLower), group.DocTitle, err)
+		}
+	}
+
+	// 打印读取到的内容用于调试
+	if contentToCheck != "" {
+		log.Printf("[异步检查] 文档 %s (FileID: %s) 读取到的最后100个字符内容: [%s]", group.DocTitle, group.FileID, contentToCheck)
+		log.Printf("[异步检查] 内容长度: %d 字符", len(contentToCheck))
+		// 检查是否包含"公开形式"字符串
+		if strings.Contains(contentToCheck, "公开形式") {
+			log.Printf("[异步检查] ✅ 在内容中找到了'公开形式'字符串")
+		} else {
+			log.Printf("[异步检查] ❌ 在内容中未找到'公开形式'字符串")
+		}
+	} else {
+		log.Printf("[异步检查] ⚠️ 文档 %s 读取到的内容为空", group.DocTitle)
+	}
+
+	// 检查是否包含"公开形式"
+	hasPublicForm := checkPublicFormInContent(contentToCheck)
+	log.Printf("[异步检查] checkPublicFormInContent 返回结果: %v", hasPublicForm)
+	group.HasPublicForm = hasPublicForm
 }
