@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Codeyangyi/personal-ai-kb/logger"
 	"github.com/tmc/langchaingo/embeddings"
 	"github.com/tmc/langchaingo/llms/ollama"
 )
@@ -92,16 +93,16 @@ func (o *OllamaEmbedderWrapper) GetDimensions() int {
 // EmbedDocuments 将文档转换为向量
 func (e *Embedder) EmbedDocuments(ctx context.Context, texts []string) ([][]float32, error) {
 	// 添加详细日志以便诊断
-	fmt.Printf("    [向量化 %s] 开始处理 %d 个文档...", e.provider, len(texts))
+	logger.Info("    [向量化 %s] 开始处理 %d 个文档...", e.provider, len(texts))
 	startTime := time.Now()
 
 	vectors, err := e.embedder.EmbedDocuments(ctx, texts)
 
 	duration := time.Since(startTime)
 	if err != nil {
-		fmt.Printf(" ❌ 失败 (耗时: %v)\n", duration.Round(time.Millisecond))
+		logger.Error(" ❌ 失败 (耗时: %v)", duration.Round(time.Millisecond))
 	} else {
-		fmt.Printf(" ✅ 完成 (耗时: %v, 速度: %.1f 文档/秒)\n",
+		logger.Info(" ✅ 完成 (耗时: %v, 速度: %.1f 文档/秒)",
 			duration.Round(time.Millisecond),
 			float64(len(texts))/duration.Seconds())
 	}

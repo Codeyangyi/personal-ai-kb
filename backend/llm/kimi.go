@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/Codeyangyi/personal-ai-kb/logger"
 )
 
 // KimiLLM Kimi2大语言模型客户端（Moonshot AI）
@@ -95,7 +97,7 @@ func (k *KimiLLM) Generate(ctx context.Context, prompt string) (string, error) {
 	}
 
 	// 调试：记录请求信息（不记录完整prompt，可能很长）
-	fmt.Printf("[Kimi2] 调用模型: %s, prompt长度: %d 字符\n", k.model, len(prompt))
+	logger.Debug("[Kimi2] 调用模型: %s, prompt长度: %d 字符\n", k.model, len(prompt))
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
@@ -131,12 +133,12 @@ func (k *KimiLLM) Generate(ctx context.Context, prompt string) (string, error) {
 		if err := json.Unmarshal(body, &errorResp); err == nil {
 			if error, ok := errorResp["error"].(map[string]interface{}); ok {
 				if message, ok := error["message"].(string); ok {
-					fmt.Printf("[Kimi2] API错误: %s\n", message)
+					logger.Debug("[Kimi2] API错误: %s\n", message)
 					return "", fmt.Errorf("Kimi2 API错误: %s", message)
 				}
 			}
 		}
-		fmt.Printf("[Kimi2] HTTP错误 %d: %s\n", resp.StatusCode, string(body))
+		logger.Debug("[Kimi2] HTTP错误 %d: %s\n", resp.StatusCode, string(body))
 		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -155,17 +157,17 @@ func (k *KimiLLM) Generate(ctx context.Context, prompt string) (string, error) {
 	finishReason := kimiResp.Choices[0].FinishReason
 
 	// 调试：显示LLM响应的详细信息
-	fmt.Printf("[Kimi2] 收到响应 - 答案长度: %d 字符, 完成原因: %s\n", len(answer), finishReason)
+	logger.Debug("[Kimi2] 收到响应 - 答案长度: %d 字符, 完成原因: %s\n", len(answer), finishReason)
 	if kimiResp.Usage.TotalTokens > 0 {
-		fmt.Printf("[Kimi2] Token使用 - 输入: %d, 输出: %d, 总计: %d\n",
+		logger.Debug("[Kimi2] Token使用 - 输入: %d, 输出: %d, 总计: %d\n",
 			kimiResp.Usage.PromptTokens, kimiResp.Usage.CompletionTokens, kimiResp.Usage.TotalTokens)
 	}
 
 	// 调试：显示答案预览（前300字符）
 	if len(answer) > 300 {
-		fmt.Printf("[Kimi2] 答案预览: %s...\n", answer[:300])
+		logger.Debug("[Kimi2] 答案预览: %s...\n", answer[:300])
 	} else {
-		fmt.Printf("[Kimi2] 完整答案: %s\n", answer)
+		logger.Debug("[Kimi2] 完整答案: %s\n", answer)
 	}
 
 	return answer, nil

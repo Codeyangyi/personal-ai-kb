@@ -11,6 +11,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/Codeyangyi/personal-ai-kb/logger"
 	"github.com/tmc/langchaingo/embeddings"
 	"github.com/tmc/langchaingo/schema"
 	"github.com/tmc/langchaingo/vectorstores"
@@ -48,11 +49,11 @@ func NewQdrantStore(qdrantURL, apiKey, collectionName string, embedder embedding
 	}
 
 	if !exists {
-		fmt.Printf("集合 '%s' 不存在，正在自动创建（向量维度: %d）...\n", collectionName, dimensions)
+		logger.Info("集合 '%s' 不存在，正在自动创建（向量维度: %d）...", collectionName, dimensions)
 		if err := createCollection(ctx, qdrantURL, apiKey, collectionName, dimensions); err != nil {
 			return nil, fmt.Errorf("failed to create collection: %w", err)
 		}
-		fmt.Printf("✅ 集合创建成功\n")
+		logger.Info("✅ 集合创建成功")
 	} else {
 		// 检查现有集合的维度是否匹配
 		existingDims, err := getCollectionDimensions(ctx, qdrantURL, apiKey, collectionName)
@@ -60,15 +61,15 @@ func NewQdrantStore(qdrantURL, apiKey, collectionName string, embedder embedding
 			return nil, fmt.Errorf("failed to get collection dimensions: %w", err)
 		}
 		if existingDims != dimensions {
-			fmt.Printf("⚠️  集合 '%s' 的维度 (%d) 与模型维度 (%d) 不匹配，正在删除并重新创建...\n", collectionName, existingDims, dimensions)
+			logger.Warn("⚠️  集合 '%s' 的维度 (%d) 与模型维度 (%d) 不匹配，正在删除并重新创建...", collectionName, existingDims, dimensions)
 			if err := deleteCollection(ctx, qdrantURL, apiKey, collectionName); err != nil {
 				return nil, fmt.Errorf("failed to delete collection: %w", err)
 			}
-			fmt.Printf("正在重新创建集合（向量维度: %d）...\n", dimensions)
+			logger.Info("正在重新创建集合（向量维度: %d）...", dimensions)
 			if err := createCollection(ctx, qdrantURL, apiKey, collectionName, dimensions); err != nil {
 				return nil, fmt.Errorf("failed to create collection: %w", err)
 			}
-			fmt.Printf("✅ 集合重新创建成功\n")
+			logger.Info("✅ 集合重新创建成功")
 		}
 	}
 

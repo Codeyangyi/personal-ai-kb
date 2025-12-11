@@ -8,6 +8,7 @@ import (
 
 	"github.com/Codeyangyi/personal-ai-kb/embedding"
 	"github.com/Codeyangyi/personal-ai-kb/llm"
+	"github.com/Codeyangyi/personal-ai-kb/logger"
 	"github.com/Codeyangyi/personal-ai-kb/store"
 	"github.com/tmc/langchaingo/schema"
 )
@@ -54,14 +55,14 @@ func (r *RAG) Query(ctx context.Context, question string) (string, error) {
 		searchTopK = 50 // 最多搜索50个结果
 	}
 
-	fmt.Print("正在向量化问题并搜索知识库...")
+	logger.Info("正在向量化问题并搜索知识库...")
 	embedStart := time.Now()
 	allResults, err := r.store.Search(ctx, question, r.embedder.GetEmbedder(), searchTopK)
 	embedDuration := time.Since(embedStart)
 	if err != nil {
 		return "", fmt.Errorf("failed to search: %w", err)
 	}
-	fmt.Printf(" ✅ (耗时: %v, 检索到 %d 个候选片段)\n", embedDuration.Round(time.Millisecond), len(allResults))
+	logger.Info(" ✅ (耗时: %v, 检索到 %d 个候选片段)", embedDuration.Round(time.Millisecond), len(allResults))
 
 	// 对结果进行严格的重排序和相关性过滤：优先选择真正相关的片段
 	results := r.reRankResults(question, allResults, r.topK)
@@ -70,14 +71,14 @@ func (r *RAG) Query(ctx context.Context, question string) (string, error) {
 	results = r.filterRelevantResults(question, results)
 
 	// 调试：显示重排序后的结果
-	fmt.Printf("[调试] 重排序后选择的前 %d 个片段（包含关键词的优先）\n", len(results))
+	logger.Debug("[调试] 重排序后选择的前 %d 个片段（包含关键词的优先）\n", len(results))
 
 	if len(results) == 0 {
 		return "抱歉，我在知识库中没有找到相关信息。", nil
 	}
 
 	// 调试：显示检索到的文档片段（完整内容，方便检查是否包含相关信息）
-	fmt.Printf("\n[调试] 检索到 %d 个相关文档片段：\n", len(results))
+	logger.Debug("\n[调试] 检索到 %d 个相关文档片段：\n", len(results))
 	for i, doc := range results {
 		// 显示完整内容（最多1000字符，避免输出过长）
 		content := doc.PageContent
@@ -85,8 +86,8 @@ func (r *RAG) Query(ctx context.Context, question string) (string, error) {
 		if len(content) > 1000 {
 			preview = content[:1000] + "..."
 		}
-		fmt.Printf("\n  [片段 %d] (长度: %d 字符)\n", i+1, len(content))
-		fmt.Printf("  内容: %s\n", preview)
+		logger.Debug("\n  [片段 %d] (长度: %d 字符)\n", i+1, len(content))
+		logger.Debug("  内容: %s\n", preview)
 
 		// 检查是否包含关键词（用于调试）
 		lowerContent := strings.ToLower(content)
@@ -99,29 +100,26 @@ func (r *RAG) Query(ctx context.Context, question string) (string, error) {
 			}
 		}
 		if len(matchedKeywords) > 0 {
-			fmt.Printf("  匹配的关键词: %v\n", matchedKeywords)
+			logger.Debug("  匹配的关键词: %v", matchedKeywords)
 		}
 
 		// 显示元数据信息
 		if len(doc.Metadata) > 0 {
-			fmt.Printf("  元数据: ")
 			metaParts := make([]string, 0)
 			if source, ok := doc.Metadata["source"].(string); ok {
 				metaParts = append(metaParts, fmt.Sprintf("来源=%s", source))
 			}
 			if len(metaParts) > 0 {
-				fmt.Printf("%s", strings.Join(metaParts, ", "))
+				logger.Debug("  元数据: %s", strings.Join(metaParts, ", "))
 			}
-			fmt.Println()
 		}
 	}
-	fmt.Println()
 
 	// 步骤2: 构建增强提示（原始问题 + 检索到的上下文）
 	prompt := r.buildPrompt(question, results)
 
 	// 步骤3: 将增强提示发送给LLM（通义千问或Ollama），生成精准、基于知识库的答案
-	fmt.Print("正在生成回答...")
+	logger.Info("正在生成回答...")
 	llmStart := time.Now()
 
 	// 创建带超时的context（120秒超时，给LLM更多时间生成）
@@ -136,10 +134,10 @@ func (r *RAG) Query(ctx context.Context, question string) (string, error) {
 		}
 		return "", fmt.Errorf("failed to generate answer: %w", err)
 	}
-	fmt.Printf(" ✅ (耗时: %v)\n", llmDuration.Round(time.Millisecond))
+	logger.Info(" ✅ (耗时: %v)\n", llmDuration.Round(time.Millisecond))
 
 	totalDuration := time.Since(startTime)
-	fmt.Printf("\n[性能] 总耗时: %v (向量检索: %v, LLM生成: %v)\n",
+	logger.Info("\n[性能] 总耗时: %v (向量检索: %v, LLM生成: %v)\n",
 		totalDuration.Round(time.Millisecond),
 		embedDuration.Round(time.Millisecond),
 		llmDuration.Round(time.Millisecond))
@@ -173,14 +171,14 @@ func (r *RAG) QueryWithResults(ctx context.Context, question string) (*QueryResu
 		searchTopK = 50 // 最多搜索50个结果
 	}
 
-	fmt.Print("正在向量化问题并搜索知识库...")
+	logger.Info("正在向量化问题并搜索知识库...")
 	embedStart := time.Now()
 	allResults, err := r.store.Search(ctx, question, r.embedder.GetEmbedder(), searchTopK)
 	embedDuration := time.Since(embedStart)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search: %w", err)
 	}
-	fmt.Printf(" ✅ (耗时: %v, 检索到 %d 个候选片段)\n", embedDuration.Round(time.Millisecond), len(allResults))
+	logger.Info(" ✅ (耗时: %v, 检索到 %d 个候选片段)\n", embedDuration.Round(time.Millisecond), len(allResults))
 
 	// 对结果进行严格的重排序和相关性过滤：优先选择真正相关的片段
 	results := r.reRankResults(question, allResults, r.topK)
@@ -189,7 +187,7 @@ func (r *RAG) QueryWithResults(ctx context.Context, question string) (*QueryResu
 	results = r.filterRelevantResults(question, results)
 
 	// 调试：显示重排序后的结果
-	fmt.Printf("[调试] 重排序后选择的前 %d 个片段（包含关键词的优先）\n", len(results))
+	logger.Debug("[调试] 重排序后选择的前 %d 个片段（包含关键词的优先）\n", len(results))
 
 	if len(results) == 0 {
 		return &QueryResult{
@@ -199,7 +197,7 @@ func (r *RAG) QueryWithResults(ctx context.Context, question string) (*QueryResu
 	}
 
 	// 调试：显示检索到的文档片段（完整内容，方便检查是否包含相关信息）
-	fmt.Printf("\n[调试] 检索到 %d 个相关文档片段：\n", len(results))
+	logger.Debug("\n[调试] 检索到 %d 个相关文档片段：\n", len(results))
 	for i, doc := range results {
 		// 显示完整内容（最多1000字符，避免输出过长）
 		content := doc.PageContent
@@ -207,8 +205,8 @@ func (r *RAG) QueryWithResults(ctx context.Context, question string) (*QueryResu
 		if len(content) > 1000 {
 			preview = content[:1000] + "..."
 		}
-		fmt.Printf("\n  [片段 %d] (长度: %d 字符)\n", i+1, len(content))
-		fmt.Printf("  内容: %s\n", preview)
+		logger.Debug("\n  [片段 %d] (长度: %d 字符)\n", i+1, len(content))
+		logger.Debug("  内容: %s\n", preview)
 
 		// 检查是否包含关键词（用于调试）
 		lowerContent := strings.ToLower(content)
@@ -221,23 +219,20 @@ func (r *RAG) QueryWithResults(ctx context.Context, question string) (*QueryResu
 			}
 		}
 		if len(matchedKeywords) > 0 {
-			fmt.Printf("  匹配的关键词: %v\n", matchedKeywords)
+			logger.Debug("  匹配的关键词: %v", matchedKeywords)
 		}
 
 		// 显示元数据信息
 		if len(doc.Metadata) > 0 {
-			fmt.Printf("  元数据: ")
 			metaParts := make([]string, 0)
 			if source, ok := doc.Metadata["source"].(string); ok {
 				metaParts = append(metaParts, fmt.Sprintf("来源=%s", source))
 			}
 			if len(metaParts) > 0 {
-				fmt.Printf("%s", strings.Join(metaParts, ", "))
+				logger.Debug("  元数据: %s", strings.Join(metaParts, ", "))
 			}
-			fmt.Println()
 		}
 	}
-	fmt.Println()
 
 	// 步骤2: 构建增强提示（原始问题 + 检索到的上下文）
 	prompt := r.buildPrompt(question, results)
@@ -247,10 +242,10 @@ func (r *RAG) QueryWithResults(ctx context.Context, question string) (*QueryResu
 	if len(prompt) > 700 {
 		promptPreview = prompt[:500] + "\n... [中间内容已省略] ...\n" + prompt[len(prompt)-200:]
 	}
-	fmt.Printf("\n[调试] 构建的Prompt预览 (%d 字符):\n%s\n", len(prompt), promptPreview)
+	logger.Debug("\n[调试] 构建的Prompt预览 (%d 字符):\n%s\n", len(prompt), promptPreview)
 
 	// 步骤3: 将增强提示发送给LLM（通义千问或Ollama），生成精准、基于知识库的答案
-	fmt.Print("正在生成回答...")
+	logger.Info("正在生成回答...")
 	llmStart := time.Now()
 
 	// 创建带超时的context（120秒超时，给LLM更多时间生成）
@@ -265,13 +260,13 @@ func (r *RAG) QueryWithResults(ctx context.Context, question string) (*QueryResu
 		}
 		return nil, fmt.Errorf("failed to generate answer: %w", err)
 	}
-	fmt.Printf(" ✅ (耗时: %v)\n", llmDuration.Round(time.Millisecond))
+	logger.Info(" ✅ (耗时: %v)\n", llmDuration.Round(time.Millisecond))
 
 	// 调试：显示LLM返回的答案（完整内容）
-	fmt.Printf("\n[调试] LLM返回的答案 (%d 字符):\n%s\n", len(answer), answer)
+	logger.Debug("\n[调试] LLM返回的答案 (%d 字符):\n%s\n", len(answer), answer)
 
 	totalDuration := time.Since(startTime)
-	fmt.Printf("\n[性能] 总耗时: %v (向量检索: %v, LLM生成: %v)\n",
+	logger.Info("\n[性能] 总耗时: %v (向量检索: %v, LLM生成: %v)\n",
 		totalDuration.Round(time.Millisecond),
 		embedDuration.Round(time.Millisecond),
 		llmDuration.Round(time.Millisecond))
@@ -392,7 +387,7 @@ func (r *RAG) reRankResults(question string, allResults []schema.Document, topK 
 	}
 
 	// 调试：显示提取的关键词
-	fmt.Printf("[调试] 提取的关键词: %v, 完整短语: %s\n", keywords, fullPhrase)
+	logger.Debug("[调试] 提取的关键词: %v, 完整短语: %s\n", keywords, fullPhrase)
 
 	// 计算每个片段的关键词匹配分数
 	type scoredDoc struct {
@@ -467,13 +462,12 @@ func (r *RAG) reRankResults(question string, allResults []schema.Document, topK 
 
 	// 调试：显示排序后的前几个片段（按分数从高到低）
 	if len(scoredDocs) > 0 {
-		fmt.Printf("[调试] 重排序后（按分数从高到低，前5个）: ")
+		logger.Debug("[调试] 重排序后（按分数从高到低，前5个）: ")
 		for i := 0; i < 5 && i < len(scoredDocs); i++ {
 			// 计算原始分数（加上索引）
 			originalScore := scoredDocs[i].score + scoredDocs[i].index
-			fmt.Printf("片段%d(原始分数:%d,最终分数:%d) ", scoredDocs[i].index+1, originalScore, scoredDocs[i].score)
+			logger.Debug("片段%d(原始分数:%d,最终分数:%d) ", scoredDocs[i].index+1, originalScore, scoredDocs[i].score)
 		}
-		fmt.Println()
 	}
 
 	// 选择前topK个结果（排序后的前topK个），但只选择分数大于0的结果
@@ -490,7 +484,7 @@ func (r *RAG) reRankResults(question string, allResults []schema.Document, topK 
 
 	// 调试：显示选择的结果
 	if len(result) > 0 {
-		fmt.Printf("[调试] 选择的结果（前%d个，已过滤不相关片段）: ", len(result))
+		logger.Debug("[调试] 选择的结果（前%d个，已过滤不相关片段）: ", len(result))
 		for i := 0; i < len(result) && i < 3; i++ {
 			// 找到这个文档在原始结果中的索引
 			originalIndex := -1
@@ -500,11 +494,10 @@ func (r *RAG) reRankResults(question string, allResults []schema.Document, topK 
 					break
 				}
 			}
-			fmt.Printf("结果%d(原始索引:%d) ", i+1, originalIndex+1)
+			logger.Debug("结果%d(原始索引:%d) ", i+1, originalIndex+1)
 		}
-		fmt.Println()
 	} else {
-		fmt.Printf("[警告] 重排序后没有找到相关片段，将使用原始结果的前%d个\n", topK)
+		logger.Warn("[警告] 重排序后没有找到相关片段，将使用原始结果的前%d个\n", topK)
 		// 如果过滤后没有结果，至少返回前topK个（即使相关性不高）
 		for i := 0; i < topK && i < len(allResults); i++ {
 			result = append(result, allResults[i])
@@ -552,11 +545,11 @@ func (r *RAG) filterRelevantResults(question string, results []schema.Document) 
 
 	// 如果无法提取关键词，返回所有结果
 	if len(coreKeywords) == 0 {
-		fmt.Printf("[调试] 无法提取核心关键词，保留所有结果\n")
+		logger.Debug("[调试] 无法提取核心关键词，保留所有结果\n")
 		return results
 	}
 
-	fmt.Printf("[调试] 提取的核心关键词: %v\n", coreKeywords)
+	logger.Debug("[调试] 提取的核心关键词: %v\n", coreKeywords)
 
 	// 过滤结果：只保留包含至少一个核心关键词的片段
 	filtered := make([]schema.Document, 0, len(results))
@@ -577,13 +570,13 @@ func (r *RAG) filterRelevantResults(question string, results []schema.Document) 
 		if hasRelevantKeyword {
 			filtered = append(filtered, doc)
 		} else {
-			fmt.Printf("[调试] 过滤掉片段 %d（不包含核心关键词）\n", i+1)
+			logger.Debug("[调试] 过滤掉片段 %d（不包含核心关键词）\n", i+1)
 		}
 	}
 
 	// 如果过滤后没有结果，至少保留前3个（避免完全无结果）
 	if len(filtered) == 0 && len(results) > 0 {
-		fmt.Printf("[警告] 相关性过滤后没有结果，保留前3个原始结果\n")
+		logger.Warn("[警告] 相关性过滤后没有结果，保留前3个原始结果\n")
 		maxKeep := 3
 		if len(results) < maxKeep {
 			maxKeep = len(results)
@@ -591,7 +584,7 @@ func (r *RAG) filterRelevantResults(question string, results []schema.Document) 
 		return results[:maxKeep]
 	}
 
-	fmt.Printf("[调试] 相关性过滤：从 %d 个结果过滤到 %d 个相关结果\n", len(results), len(filtered))
+	logger.Debug("[调试] 相关性过滤：从 %d 个结果过滤到 %d 个相关结果\n", len(results), len(filtered))
 	return filtered
 }
 
@@ -626,7 +619,7 @@ func (r *RAG) AddDocuments(ctx context.Context, docs []schema.Document) error {
 	totalBatches := (len(docs) + batchSize - 1) / batchSize
 	startTime := time.Now()
 
-	fmt.Printf("使用批次大小: %d，共 %d 批\n", batchSize, totalBatches)
+	logger.Info("使用批次大小: %d，共 %d 批\n", batchSize, totalBatches)
 
 	for i := 0; i < len(docs); i += batchSize {
 		end := i + batchSize
@@ -638,7 +631,7 @@ func (r *RAG) AddDocuments(ctx context.Context, docs []schema.Document) error {
 		batchNum := (i / batchSize) + 1
 		batchStartTime := time.Now()
 
-		fmt.Printf("正在处理第 %d/%d 批 (%d 个文档)...", batchNum, totalBatches, len(batch))
+		logger.Info("正在处理第 %d/%d 批 (%d 个文档)...", batchNum, totalBatches, len(batch))
 
 		// 存储到向量数据库（会自动批量向量化）
 		// 添加重试机制，处理速率限制错误
@@ -663,7 +656,7 @@ func (r *RAG) AddDocuments(ctx context.Context, docs []schema.Document) error {
 			if isRateLimit && retry < maxRetries-1 {
 				// 速率限制错误，等待后重试（指数退避）
 				waitTime := retryDelay * time.Duration(1<<uint(retry)) // 2秒, 4秒, 8秒
-				fmt.Printf(" ⚠️  遇到速率限制，等待 %v 后重试 (第 %d/%d 次重试)...\n", waitTime.Round(time.Second), retry+1, maxRetries)
+				logger.Warn(" ⚠️  遇到速率限制，等待 %v 后重试 (第 %d/%d 次重试)...\n", waitTime.Round(time.Second), retry+1, maxRetries)
 				time.Sleep(waitTime)
 				continue
 			}
@@ -696,13 +689,13 @@ func (r *RAG) AddDocuments(ctx context.Context, docs []schema.Document) error {
 		remainingDocs := len(docs) - processedCount
 		estimatedRemaining := time.Duration(remainingDocs) * avgTimePerDoc
 
-		fmt.Printf(" ✅ 完成 (耗时: %v, 已处理: %d/%d, 预计剩余: %v, 速度: %.1f 文档/秒)\n",
+		logger.Info(" ✅ 完成 (耗时: %v, 已处理: %d/%d, 预计剩余: %v, 速度: %.1f 文档/秒)\n",
 			batchDuration.Round(time.Second), processedCount, len(docs), estimatedRemaining.Round(time.Second),
 			float64(len(batch))/batchDuration.Seconds())
 	}
 
 	totalDuration := time.Since(startTime)
-	fmt.Printf("\n🎉 全部完成！共处理 %d 个文档，总耗时: %v，平均: %v/文档，速度: %.1f 文档/秒\n",
+	logger.Info("\n🎉 全部完成！共处理 %d 个文档，总耗时: %v，平均: %v/文档，速度: %.1f 文档/秒\n",
 		len(docs), totalDuration.Round(time.Second),
 		(totalDuration / time.Duration(len(docs))).Round(time.Millisecond),
 		float64(len(docs))/totalDuration.Seconds())

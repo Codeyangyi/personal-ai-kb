@@ -25,7 +25,7 @@
           class="search-input"
         />
         <button type="submit" :disabled="!query.trim() || searching" class="search-btn">
-          {{ searching ? '检索中...' : 'AI 搜索' }}
+          {{ searching ? '思考中...' : 'AI 搜索' }}
         </button>
       </form>
 
@@ -115,7 +115,7 @@
         </div>
       </div>
       <div class="empty" v-else-if="searching">
-        <p>正在搜索...</p>
+        <p>正在思考...</p>
       </div>
       <div class="empty error" v-else-if="searchError">
         <p>{{ searchError }}</p>

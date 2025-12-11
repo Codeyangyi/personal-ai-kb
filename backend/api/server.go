@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -20,6 +19,7 @@ import (
 	"github.com/Codeyangyi/personal-ai-kb/embedding"
 	"github.com/Codeyangyi/personal-ai-kb/llm"
 	"github.com/Codeyangyi/personal-ai-kb/loader"
+	"github.com/Codeyangyi/personal-ai-kb/logger"
 	"github.com/Codeyangyi/personal-ai-kb/rag"
 	"github.com/Codeyangyi/personal-ai-kb/splitter"
 	"github.com/Codeyangyi/personal-ai-kb/store"
@@ -102,21 +102,21 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("创建通义千问客户端失败: %v", err)
 		}
-		log.Printf("使用通义千问模型: %s", cfg.DashScopeModel)
+		logger.Info("使用通义千问模型: %s", cfg.DashScopeModel)
 	} else if cfg.LLMProvider == "kimi" {
 		// 使用Kimi2
 		llmClient, err = llm.NewKimiLLM(cfg.MoonshotAPIKey, cfg.MoonshotModel)
 		if err != nil {
 			return nil, fmt.Errorf("创建Kimi2客户端失败: %v", err)
 		}
-		log.Printf("使用Kimi2模型: %s", cfg.MoonshotModel)
+		logger.Info("使用Kimi2模型: %s", cfg.MoonshotModel)
 	} else {
 		// 使用Ollama
 		llmClient, err = llm.NewOllamaLLM(cfg.OllamaBaseURL, cfg.OllamaModel)
 		if err != nil {
 			return nil, fmt.Errorf("创建Ollama客户端失败: %v", err)
 		}
-		log.Printf("使用Ollama模型: %s", cfg.OllamaModel)
+		logger.Info("使用Ollama模型: %s", cfg.OllamaModel)
 	}
 
 	// 创建RAG系统
@@ -146,16 +146,16 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		if _, err := db.Exec(createTableSQL); err != nil {
 			return nil, fmt.Errorf("创建反馈表失败: %v", err)
 		}
-		log.Println("MySQL 已连接，反馈表初始化成功")
+		logger.Info("MySQL 已连接，反馈表初始化成功")
 	} else {
-		log.Println("未配置 MYSQL_DSN，意见反馈将不会写入数据库")
+		logger.Info("未配置 MYSQL_DSN，意见反馈将不会写入数据库")
 	}
 
 	// 获取管理员token（从环境变量或配置）
 	adminToken := os.Getenv("ADMIN_TOKEN")
 	if adminToken == "" {
 		adminToken = "Zhzx@666" // 默认token，生产环境应该使用强密码
-		log.Println("警告: 使用默认管理员token，建议设置 ADMIN_TOKEN 环境变量")
+		logger.Info("警告: 使用默认管理员token，建议设置 ADMIN_TOKEN 环境变量")
 	}
 
 	// 创建文件存储目录（在backend目录下）
@@ -203,7 +203,7 @@ func (s *Server) Start(port string) error {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			defer func() {
 				if err := recover(); err != nil {
-					log.Printf("请求处理发生panic: %v, 请求路径: %s, 方法: %s, 堆栈: %s",
+					logger.Error("请求处理发生panic: %v, 请求路径: %s, 方法: %s, 堆栈: %s",
 						err, r.URL.Path, r.Method, getStackTrace())
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusInternalServerError)
@@ -295,7 +295,7 @@ func (s *Server) Start(port string) error {
 		IdleTimeout:  120 * time.Second, // 空闲连接超时：2分钟
 	}
 
-	log.Printf("服务器启动在 http://localhost%s (超时设置: 读取/写入30分钟)", server.Addr)
+	logger.Info("服务器启动在 http://localhost%s (超时设置: 读取/写入30分钟)", server.Addr)
 	return server.ListenAndServe()
 }
 
@@ -423,7 +423,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		// 保存失败文件到失败目录
 		failureReason := fmt.Sprintf("加载文档失败: %s", userFriendlyMsg)
 		if saveErr := s.saveFailedFile(savedPath, header.Filename, failureReason); saveErr != nil {
-			log.Printf("保存失败文件时出错: %v", saveErr)
+			logger.Error("保存失败文件时出错: %v", saveErr)
 			os.Remove(savedPath) // 如果保存失败，删除原文件
 		}
 
@@ -457,7 +457,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		// 保存失败文件到失败目录
 		failureReason := fmt.Sprintf("切分文档失败: %v", err)
 		if saveErr := s.saveFailedFile(savedPath, header.Filename, failureReason); saveErr != nil {
-			log.Printf("保存失败文件时出错: %v", saveErr)
+			logger.Error("保存失败文件时出错: %v", saveErr)
 			os.Remove(savedPath) // 如果保存失败，删除原文件
 		}
 		http.Error(w, fmt.Sprintf("Failed to split document: %v", err), http.StatusInternalServerError)
@@ -470,10 +470,10 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		// 向量化失败：保存失败文件到失败目录
 		failureReason := fmt.Sprintf("向量化失败: %v", err)
 		if saveErr := s.saveFailedFile(savedPath, header.Filename, failureReason); saveErr != nil {
-			log.Printf("保存失败文件时出错: %v", saveErr)
+			logger.Error("保存失败文件时出错: %v", saveErr)
 			os.Remove(savedPath) // 如果保存失败，删除原文件
 		}
-		log.Printf("向量化失败，已保存失败文件: %s, 错误: %v", savedPath, err)
+		logger.Error("向量化失败，已保存失败文件: %s, 错误: %v", savedPath, err)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"success":  false,
@@ -563,7 +563,7 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 
 		file, err := fileHeader.Open()
 		if err != nil {
-			log.Printf("Failed to open file %s: %v", fileHeader.Filename, err)
+			logger.Error("Failed to open file %s: %v", fileHeader.Filename, err)
 			results = append(results, FileResult{
 				Filename: fileHeader.Filename,
 				Success:  false,
@@ -586,7 +586,7 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 		savedFile, err := os.Create(savedPath)
 		if err != nil {
 			file.Close()
-			log.Printf("Failed to create file for %s: %v", fileHeader.Filename, err)
+			logger.Error("Failed to create file for %s: %v", fileHeader.Filename, err)
 			results = append(results, FileResult{
 				Filename: fileHeader.Filename,
 				Success:  false,
@@ -604,10 +604,10 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 			// 保存失败文件到失败目录
 			failureReason := fmt.Sprintf("保存文件失败: %v", err)
 			if saveErr := s.saveFailedFile(savedPath, fileHeader.Filename, failureReason); saveErr != nil {
-				log.Printf("保存失败文件时出错: %v", saveErr)
+				logger.Error("保存失败文件时出错: %v", saveErr)
 				os.Remove(savedPath) // 如果保存失败，删除原文件
 			}
-			log.Printf("Failed to save file %s: %v", fileHeader.Filename, err)
+			logger.Error("Failed to save file %s: %v", fileHeader.Filename, err)
 			results = append(results, FileResult{
 				Filename: fileHeader.Filename,
 				Success:  false,
@@ -620,7 +620,7 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 		// 加载文档
 		docs, err := fileLoader.Load(savedPath)
 		if err != nil {
-			log.Printf("Failed to load document %s: %v", fileHeader.Filename, err)
+			logger.Error("Failed to load document %s: %v", fileHeader.Filename, err)
 			// 提取更友好的错误信息
 			errMsg := err.Error()
 			userFriendlyMsg := errMsg
@@ -641,7 +641,7 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 			// 保存失败文件到失败目录
 			failureReason := fmt.Sprintf("加载文档失败: %s", userFriendlyMsg)
 			if saveErr := s.saveFailedFile(savedPath, fileHeader.Filename, failureReason); saveErr != nil {
-				log.Printf("保存失败文件时出错: %v", saveErr)
+				logger.Error("保存失败文件时出错: %v", saveErr)
 				os.Remove(savedPath) // 如果保存失败，删除原文件
 			}
 
@@ -674,10 +674,10 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 			// 保存失败文件到失败目录
 			failureReason := fmt.Sprintf("切分文档失败: %v", err)
 			if saveErr := s.saveFailedFile(savedPath, fileHeader.Filename, failureReason); saveErr != nil {
-				log.Printf("保存失败文件时出错: %v", saveErr)
+				logger.Error("保存失败文件时出错: %v", saveErr)
 				os.Remove(savedPath) // 如果保存失败，删除原文件
 			}
-			log.Printf("Failed to split document %s: %v", fileHeader.Filename, err)
+			logger.Error("Failed to split document %s: %v", fileHeader.Filename, err)
 			results = append(results, FileResult{
 				Filename: fileHeader.Filename,
 				Success:  false,
@@ -688,7 +688,7 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 		}
 
 		allChunks = append(allChunks, chunks...)
-		log.Printf("文件 %s 处理成功，生成 %d 个文本块，累计 %d 个文本块", fileHeader.Filename, len(chunks), len(allChunks))
+		logger.Info("文件 %s 处理成功，生成 %d 个文本块，累计 %d 个文本块", fileHeader.Filename, len(chunks), len(allChunks))
 
 		// 保存文件信息
 		fileInfo := &FileInfo{
@@ -717,9 +717,9 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 	var vectorizedChunks int
 	if len(allChunks) > 0 {
 		ctx := context.Background()
-		log.Printf("开始向量化 %d 个文本块...", len(allChunks))
+		logger.Info("开始向量化 %d 个文本块...", len(allChunks))
 		if err := s.ragSystem.AddDocuments(ctx, allChunks); err != nil {
-			log.Printf("向量化失败: %v", err)
+			logger.Error("向量化失败: %v", err)
 			vectorizationError = err
 
 			// 向量化失败时，将所有成功处理的文件移动到失败目录
@@ -737,7 +737,7 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 
 						// 保存失败文件
 						if saveErr := s.saveFailedFile(filePath, fileInfo.Filename, failureReason); saveErr != nil {
-							log.Printf("保存失败文件时出错: %v", saveErr)
+							logger.Error("保存失败文件时出错: %v", saveErr)
 						} else {
 							// 从文件列表中删除
 							delete(s.files, result.FileID)
@@ -751,11 +751,11 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		} else {
-			log.Printf("向量化成功，共处理 %d 个文本块", len(allChunks))
+			logger.Info("向量化成功，共处理 %d 个文本块", len(allChunks))
 			vectorizedChunks = len(allChunks)
 		}
 	} else {
-		log.Printf("没有需要向量化的文本块")
+		logger.Info("没有需要向量化的文本块")
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -784,7 +784,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// 添加panic恢复，确保即使发生panic也不会导致服务崩溃
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("⚠️ handleQuery发生panic: %v, 堆栈: %s", r, getStackTrace())
+			logger.Error("⚠️ handleQuery发生panic: %v, 堆栈: %s", r, getStackTrace())
 			// 尝试返回错误响应
 			if w.Header().Get("Content-Type") == "" {
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -814,7 +814,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Printf("解析请求体失败: %v", err)
+		logger.Error("解析请求体失败: %v", err)
 		w.WriteHeader(http.StatusBadRequest)
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"error":   "Invalid request",
@@ -839,7 +839,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// 创建临时RAG实例用于查询（使用指定的topK）
 	tempRAG := rag.NewRAG(s.embedder, s.store, s.llm, req.TopK)
 
-	log.Printf("收到查询请求: %s (topK=%d), 客户端: %s", req.Question, req.TopK, r.RemoteAddr)
+	logger.Info("收到查询请求: %s (topK=%d), 客户端: %s", req.Question, req.TopK, r.RemoteAddr)
 
 	// 优化：使用请求的context，并添加超时控制（50秒），确保请求可以取消
 	// 减少超时时间，避免LLM调用时间过长导致服务被停止
@@ -853,25 +853,25 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("⚠️ QueryWithResults发生panic: %v, 堆栈: %s", r, getStackTrace())
+				logger.Error("⚠️ QueryWithResults发生panic: %v, 堆栈: %s", r, getStackTrace())
 				err = fmt.Errorf("查询处理时发生panic: %v", r)
 			}
 		}()
 		queryResult, err = tempRAG.QueryWithResults(ctx, req.Question)
 	}()
 	if err != nil {
-		log.Printf("查询失败 - 问题: %s, 错误: %v, 错误类型: %T, 客户端: %s", req.Question, err, err, r.RemoteAddr)
+		logger.Error("查询失败 - 问题: %s, 错误: %v, 错误类型: %T, 客户端: %s", req.Question, err, err, r.RemoteAddr)
 		// 返回更详细的错误信息
 		w.WriteHeader(http.StatusInternalServerError)
 		if encodeErr := json.NewEncoder(w).Encode(map[string]interface{}{
 			"error":   "查询失败",
 			"message": err.Error(),
 		}); encodeErr != nil {
-			log.Printf("编码错误响应失败: %v", encodeErr)
+			logger.Error("编码错误响应失败: %v", encodeErr)
 		}
 		return
 	}
-	log.Printf("查询成功，答案长度: %d 字符, 结果数量: %d", len(queryResult.Answer), len(queryResult.Results))
+	logger.Info("查询成功，答案长度: %d 字符, 结果数量: %d", len(queryResult.Answer), len(queryResult.Results))
 
 	// 分析答案中的标注，找出被使用的文档片段编号
 	usedIndices := extractUsedAnnotations(queryResult.Answer)
@@ -910,7 +910,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			defer wg.Done()
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("⚠️ 处理文档片段时发生panic: %v, 索引: %d", r, idx)
+					logger.Error("⚠️ 处理文档片段时发生panic: %v, 索引: %d", r, idx)
 				}
 			}()
 
@@ -1068,11 +1068,11 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			// 尝试放入队列（非阻塞）
 			select {
 			case s.checkQueue <- checkTask:
-				log.Printf("📋 文档 %s 已加入异步检查队列", group.DocTitle)
+				logger.Info("📋 文档 %s 已加入异步检查队列", group.DocTitle)
 				checkTasks = append(checkTasks, checkTask)
 			default:
 				// 队列已满，记录警告，使用更安全的默认值（不允许下载）
-				log.Printf("⚠️ 检查队列已满，跳过异步检查: %s（使用安全默认值：不允许下载）", group.DocTitle)
+				logger.Info("⚠️ 检查队列已满，跳过异步检查: %s（使用安全默认值：不允许下载）", group.DocTitle)
 				group.HasPublicForm = true // 改为true，不允许下载（更安全）
 			}
 		} else {
@@ -1096,9 +1096,9 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 				processedTasks[task.group] = true
 				completedCount++
 				if hasPublicForm {
-					log.Printf("✅ 文档 %s 检查完成，包含'公开形式'（不允许下载）", task.group.DocTitle)
+					logger.Info("✅ 文档 %s 检查完成，包含'公开形式'（不允许下载）", task.group.DocTitle)
 				} else {
-					log.Printf("✅ 文档 %s 检查完成，不包含'公开形式'（允许下载）", task.group.DocTitle)
+					logger.Info("✅ 文档 %s 检查完成，不包含'公开形式'（允许下载）", task.group.DocTitle)
 				}
 			default:
 				// 检查未完成，稍后处理
@@ -1112,7 +1112,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 				maxWaitTime = 300 * time.Millisecond // 文档多时300ms
 			}
 			
-			log.Printf("等待 %d 个文档的检查结果（最多等待%v）...", len(checkTasks)-completedCount, maxWaitTime)
+			logger.Info("等待 %d 个文档的检查结果（最多等待%v）...", len(checkTasks)-completedCount, maxWaitTime)
 			
 			// 使用带超时的select，非阻塞等待
 			timeout := time.NewTimer(maxWaitTime)
@@ -1127,7 +1127,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 				select {
 				case <-timeout.C:
 					// 超时，停止等待
-					log.Printf("等待超时，已收集 %d/%d 个检查结果", completedCount, len(checkTasks))
+					logger.Info("等待超时，已收集 %d/%d 个检查结果", completedCount, len(checkTasks))
 					break waitLoop
 				case <-ticker.C:
 					// 检查是否有新的完成
@@ -1141,9 +1141,9 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 							processedTasks[task.group] = true
 							completedCount++
 							if hasPublicForm {
-								log.Printf("✅ 文档 %s 检查完成，包含'公开形式'（不允许下载）", task.group.DocTitle)
+								logger.Info("✅ 文档 %s 检查完成，包含'公开形式'（不允许下载）", task.group.DocTitle)
 							} else {
-								log.Printf("✅ 文档 %s 检查完成，不包含'公开形式'（允许下载）", task.group.DocTitle)
+								logger.Info("✅ 文档 %s 检查完成，不包含'公开形式'（允许下载）", task.group.DocTitle)
 							}
 						default:
 						}
@@ -1164,28 +1164,28 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 				task.group.HasPublicForm = hasPublicForm
 				processedTasks[task.group] = true
 				if hasPublicForm {
-					log.Printf("✅ 文档 %s 检查完成（最后读取），包含'公开形式'（不允许下载）", task.group.DocTitle)
+					logger.Info("✅ 文档 %s 检查完成（最后读取），包含'公开形式'（不允许下载）", task.group.DocTitle)
 				} else {
-					log.Printf("✅ 文档 %s 检查完成（最后读取），不包含'公开形式'（允许下载）", task.group.DocTitle)
+					logger.Info("✅ 文档 %s 检查完成（最后读取），不包含'公开形式'（允许下载）", task.group.DocTitle)
 				}
 			default:
 				// 检查未完成，使用更安全的默认值（不允许下载）
 				// 这样即使检查失败，也不会误允许下载包含"公开形式"的文档
 				task.group.HasPublicForm = true // 改为true，不允许下载（更安全）
-				log.Printf("⏳ 文档 %s 检查未完成，使用安全默认值：不允许下载（检查在后台继续）", task.group.DocTitle)
+				logger.Info("⏳ 文档 %s 检查未完成，使用安全默认值：不允许下载（检查在后台继续）", task.group.DocTitle)
 			}
 		}
 		
-		log.Printf("检查结果收集完成，完成: %d/%d（异步检查，不阻塞主请求）", completedCount, len(checkTasks))
+		logger.Info("检查结果收集完成，完成: %d/%d（异步检查，不阻塞主请求）", completedCount, len(checkTasks))
 	}
 	
-	log.Printf("所有文档检查处理完成，立即返回响应")
+	logger.Info("所有文档检查处理完成，立即返回响应")
 
 	// 按原始顺序添加到docGroups（完全异步，不等待检查结果）
-	log.Printf("开始构建响应数据，docGroupsMap数量: %d", len(docGroupsMap))
+	logger.Info("开始构建响应数据，docGroupsMap数量: %d", len(docGroupsMap))
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("⚠️ 构建响应数据时发生panic: %v, 堆栈: %s", r, getStackTrace())
+			logger.Error("⚠️ 构建响应数据时发生panic: %v, 堆栈: %s", r, getStackTrace())
 		}
 	}()
 	
@@ -1193,7 +1193,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	for _, group := range docGroupsMap {
 		docGroups = append(docGroups, *group)
 	}
-	log.Printf("docGroups构建完成，共 %d 个文档组（检查在后台异步进行）", len(docGroups))
+	logger.Info("docGroups构建完成，共 %d 个文档组（检查在后台异步进行）", len(docGroups))
 
 	// 构建响应数据
 	// 限制响应大小，避免内存溢出和502错误
@@ -1201,7 +1201,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	const maxDocGroups = 50
 	limitedDocGroups := docGroups
 	if len(docGroups) > maxDocGroups {
-		log.Printf("⚠️ 文档组数量过多 (%d > %d)，只返回前 %d 个", len(docGroups), maxDocGroups, maxDocGroups)
+		logger.Info("⚠️ 文档组数量过多 (%d > %d)，只返回前 %d 个", len(docGroups), maxDocGroups, maxDocGroups)
 		limitedDocGroups = docGroups[:maxDocGroups]
 	}
 	
@@ -1216,7 +1216,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		
 		// 限制chunks数量
 		if len(limitedDocGroups[i].Chunks) > maxChunksPerGroup {
-			log.Printf("⚠️ 文档 %s 的chunks数量过多 (%d > %d)，只返回前 %d 个", limitedDocGroups[i].DocTitle, len(limitedDocGroups[i].Chunks), maxChunksPerGroup, maxChunksPerGroup)
+			logger.Info("⚠️ 文档 %s 的chunks数量过多 (%d > %d)，只返回前 %d 个", limitedDocGroups[i].DocTitle, len(limitedDocGroups[i].Chunks), maxChunksPerGroup, maxChunksPerGroup)
 			limitedDocGroups[i].Chunks = limitedDocGroups[i].Chunks[:maxChunksPerGroup]
 		}
 		
@@ -1235,14 +1235,14 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	for _, g := range limitedDocGroups {
 		totalChunksAfter += len(g.Chunks)
 	}
-	log.Printf("响应数据限制完成，文档组数: %d, 总chunks数: %d -> %d", len(limitedDocGroups), totalChunksBefore, totalChunksAfter)
+	logger.Info("响应数据限制完成，文档组数: %d, 总chunks数: %d -> %d", len(limitedDocGroups), totalChunksBefore, totalChunksAfter)
 	
 	// 构建响应数据，添加错误处理
 	var response map[string]interface{}
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("⚠️ 构建response map时发生panic: %v, 堆栈: %s", r, getStackTrace())
+				logger.Error("⚠️ 构建response map时发生panic: %v, 堆栈: %s", r, getStackTrace())
 				// 使用简化的响应
 				response = map[string]interface{}{
 					"answer":    queryResult.Answer,
@@ -1257,7 +1257,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			"docGroups": limitedDocGroups,     // 按文档分组的格式（新格式）
 		}
 	}()
-	log.Printf("响应数据构建完成，准备编码JSON，answer长度: %d, results数量: %d, docGroups数量: %d", len(queryResult.Answer), len(searchResults), len(limitedDocGroups))
+	logger.Info("响应数据构建完成，准备编码JSON，answer长度: %d, results数量: %d, docGroups数量: %d", len(queryResult.Answer), len(searchResults), len(limitedDocGroups))
 
 	// 设置响应头，确保即使编码失败也能正确返回
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -1267,12 +1267,12 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// 这样即使后续处理出现问题，客户端也能知道请求已收到
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
-		log.Printf("✅ 响应头已提前刷新，避免502错误")
+		logger.Info("✅ 响应头已提前刷新，避免502错误")
 	}
 
 	// 检查context是否已取消（超时）
 	if ctx.Err() != nil {
-		log.Printf("⚠️ 请求context已取消: %v, 问题: %s", ctx.Err(), req.Question)
+		logger.Info("⚠️ 请求context已取消: %v, 问题: %s", ctx.Err(), req.Question)
 		// 如果context已取消，尝试返回错误响应
 		if w.Header().Get("Content-Type") == "" {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -1287,20 +1287,20 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	
 	// 记录响应大小，用于监控
 	responseSize := len(queryResult.Answer) + len(limitedDocGroups)*100 // 粗略估算
-	log.Printf("准备发送响应，答案长度: %d 字符, 文档组数: %d, 估算响应大小: %d 字节", len(queryResult.Answer), len(limitedDocGroups), responseSize)
+	logger.Info("准备发送响应，答案长度: %d 字符, 文档组数: %d, 估算响应大小: %d 字节", len(queryResult.Answer), len(limitedDocGroups), responseSize)
 	
 	// 检查客户端连接是否已关闭
 	if r.Context().Err() != nil {
-		log.Printf("⚠️ 客户端连接已关闭: %v, 问题: %s", r.Context().Err(), req.Question)
+		logger.Info("⚠️ 客户端连接已关闭: %v, 问题: %s", r.Context().Err(), req.Question)
 		return
 	}
 	
 	// 编码响应，确保错误处理
 	// 使用缓冲写入，避免大响应导致问题
-	log.Printf("开始编码JSON响应...")
+	logger.Info("开始编码JSON响应...")
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("⚠️ 编码响应时发生panic: %v, 堆栈: %s", r, getStackTrace())
+			logger.Error("⚠️ 编码响应时发生panic: %v, 堆栈: %s", r, getStackTrace())
 			// 尝试返回错误响应
 			if w.Header().Get("Content-Type") == "" {
 				w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -1317,7 +1317,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	encoder.SetIndent("", "") // 不格式化，减少响应大小
 	
 	if err := encoder.Encode(response); err != nil {
-		log.Printf("⚠️ 编码查询响应失败: %v, 问题: %s, 错误类型: %T", err, req.Question, err)
+		logger.Error("⚠️ 编码查询响应失败: %v, 问题: %s, 错误类型: %T", err, req.Question, err)
 		// 如果编码失败，尝试返回一个简单的错误响应
 		// 注意：此时响应头可能已经部分写入，但这是最后的尝试
 		if w.Header().Get("Content-Type") == "" {
@@ -1332,15 +1332,15 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	
-	log.Printf("JSON编码完成，准备刷新响应...")
+	logger.Info("JSON编码完成，准备刷新响应...")
 	
 	// 尝试刷新响应（如果支持），确保数据及时发送，避免超时导致502
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
-		log.Printf("✅ 响应已刷新，确保数据及时发送")
+		logger.Info("✅ 响应已刷新，确保数据及时发送")
 	}
 
-	log.Printf("✅ 查询响应已成功发送，答案长度: %d 字符, 文档组数: %d", len(queryResult.Answer), len(limitedDocGroups))
+	logger.Info("✅ 查询响应已成功发送，答案长度: %d 字符, 文档组数: %d", len(queryResult.Answer), len(limitedDocGroups))
 }
 
 // loadDocumentLastPart 加载PDF或Word文档的最后部分（只加载最后几个字符）
@@ -1369,7 +1369,7 @@ func loadDocumentLastPart(filePath string, fileType string, maxChars int) (strin
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("⚠️ loadDocumentLastPart加载文档时发生panic: %v", r)
+				logger.Error("⚠️ loadDocumentLastPart加载文档时发生panic: %v", r)
 				resultChan <- loadResult{err: fmt.Errorf("加载文档时发生panic: %v", r)}
 			}
 		}()
@@ -1387,7 +1387,7 @@ func loadDocumentLastPart(filePath string, fileType string, maxChars int) (strin
 		err = result.err
 	case <-ctx.Done():
 		// 超时，返回错误，避免继续占用内存和CPU
-		log.Printf("⚠️ 加载文档超时（超过1.5秒）: %s", filePath)
+		logger.Info("⚠️ 加载文档超时（超过1.5秒）: %s", filePath)
 		return "", fmt.Errorf("加载文档超时（超过1.5秒）")
 	}
 
@@ -1593,7 +1593,7 @@ func (s *Server) isFileDuplicate(filename string, size int64) bool {
 func (s *Server) loadFilesFromDisk() {
 	entries, err := os.ReadDir(s.filesDir)
 	if err != nil {
-		log.Printf("读取文件目录失败: %v", err)
+		logger.Error("读取文件目录失败: %v", err)
 		return
 	}
 
@@ -1646,7 +1646,7 @@ func (s *Server) loadFilesFromDisk() {
 		}
 	}
 
-	log.Printf("从磁盘加载了 %d 个文件", len(s.files))
+	logger.Info("从磁盘加载了 %d 个文件", len(s.files))
 }
 
 // handleFileList 获取文件列表
@@ -1763,7 +1763,7 @@ func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request) {
 	// 复制文件内容到响应
 	_, err = io.Copy(w, file)
 	if err != nil {
-		log.Printf("Failed to send file: %v", err)
+		logger.Info("Failed to send file: %v", err)
 	}
 }
 
@@ -1807,13 +1807,13 @@ func (s *Server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 		filePath = oldFormatPath
 	} else {
 		// 文件不存在，但仍然从列表中删除
-		log.Printf("文件 %s 在磁盘上不存在，仅从列表中删除", path)
+		logger.Info("文件 %s 在磁盘上不存在，仅从列表中删除", path)
 	}
 
 	// 删除磁盘上的文件
 	if filePath != "" {
 		if err := os.Remove(filePath); err != nil {
-			log.Printf("删除文件失败: %v", err)
+			logger.Error("删除文件失败: %v", err)
 			// 继续执行，即使删除文件失败也继续删除记录
 		}
 	}
@@ -1825,7 +1825,7 @@ func (s *Server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 	// 通过metadata中的source字段匹配文件路径
 	ctx := context.Background()
 	if err := s.deleteDocumentsBySource(ctx, filePath); err != nil {
-		log.Printf("从向量数据库删除文档失败: %v", err)
+		logger.Error("从向量数据库删除文档失败: %v", err)
 		// 即使删除向量数据库中的文档失败，也返回成功（因为文件已删除）
 	}
 
@@ -1852,7 +1852,7 @@ func (s *Server) deleteDocumentsBySource(ctx context.Context, sourcePath string)
 	// 或者，我们可以重新构建整个知识库（删除所有，然后重新添加其他文件）
 	// 为了简化，这里先只删除文件，向量数据库中的文档可以保留（不影响功能）
 
-	log.Printf("注意：向量数据库中的文档（source=%s）需要手动清理或通过Qdrant API删除", sourcePath)
+	logger.Info("注意：向量数据库中的文档（source=%s）需要手动清理或通过Qdrant API删除", sourcePath)
 	return nil
 }
 
@@ -1893,7 +1893,7 @@ func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request) {
 		// 创建图片保存目录：./uploads/feedback-images
 		imageDir := filepath.Join(s.filesDir, "feedback-images")
 		if err := os.MkdirAll(imageDir, 0755); err != nil {
-			log.Printf("创建反馈图片目录失败: %v", err)
+			logger.Error("创建反馈图片目录失败: %v", err)
 		} else {
 			// 使用时间戳+原始文件名，避免重名
 			ext := filepath.Ext(header.Filename)
@@ -1907,10 +1907,10 @@ func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request) {
 			fullPath := filepath.Join(imageDir, savedName)
 			out, err := os.Create(fullPath)
 			if err != nil {
-				log.Printf("保存反馈图片失败: %v", err)
+				logger.Error("保存反馈图片失败: %v", err)
 			} else {
 				if _, err := io.Copy(out, file); err != nil {
-					log.Printf("写入反馈图片失败: %v", err)
+					logger.Error("写入反馈图片失败: %v", err)
 				} else {
 					// 在数据库中记录相对路径（相对于 backend 根目录）
 					relPath := filepath.ToSlash(filepath.Join("uploads", "feedback-images", savedName))
@@ -1926,7 +1926,7 @@ func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request) {
 	query := `INSERT INTO feedbacks (name, title, description, image, created_at) VALUES (?, ?, ?, ?, ?)`
 	_, err = s.db.Exec(query, name, title, description, imagePath, time.Now())
 	if err != nil {
-		log.Printf("保存反馈失败: %v", err)
+		logger.Error("保存反馈失败: %v", err)
 		http.Error(w, fmt.Sprintf("保存反馈失败: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -1983,7 +1983,7 @@ func (s *Server) saveFailedFile(filePath, originalFilename, reason string) error
 		os.Remove(filePath) // 删除原文件
 	}
 
-	log.Printf("失败文件已保存: %s, 原因: %s", failedPath, reason)
+	logger.Info("失败文件已保存: %s, 原因: %s", failedPath, reason)
 	return nil
 }
 
@@ -2032,12 +2032,12 @@ func getStackTrace() string {
 func (s *Server) startAsyncCheckWorkers() {
 	for i := 0; i < s.checkWorkers; i++ {
 		go func(workerID int) {
-			log.Printf("启动异步检查工作协程 #%d", workerID)
+			logger.Info("启动异步检查工作协程 #%d", workerID)
 			for task := range s.checkQueue {
 				func() {
 					defer func() {
 						if r := recover(); r != nil {
-							log.Printf("⚠️ 异步检查工作协程 #%d 发生panic: %v, 文档: %s", workerID, r, task.group.DocTitle)
+							logger.Error("⚠️ 异步检查工作协程 #%d 发生panic: %v, 文档: %s", workerID, r, task.group.DocTitle)
 							// panic时发送默认结果（如果resultChan存在）
 							if task.resultChan != nil {
 								select {
@@ -2049,7 +2049,7 @@ func (s *Server) startAsyncCheckWorkers() {
 					}()
 					
 					// 执行检查
-					log.Printf("[工作协程 #%d] 开始检查文档: %s (FileID: %s)", workerID, task.group.DocTitle, task.group.FileID)
+					logger.Info("[工作协程 #%d] 开始检查文档: %s (FileID: %s)", workerID, task.group.DocTitle, task.group.FileID)
 					s.checkPublicFormAsync(task.group)
 					
 					// 发送结果（如果resultChan存在，完全异步模式下为nil）
@@ -2057,28 +2057,28 @@ func (s *Server) startAsyncCheckWorkers() {
 						select {
 						case task.resultChan <- task.group.HasPublicForm:
 							if task.group.HasPublicForm {
-								log.Printf("[工作协程 #%d] ✅ 文档 %s 检查完成，包含'公开形式'", workerID, task.group.DocTitle)
+								logger.Info("[工作协程 #%d] ✅ 文档 %s 检查完成，包含'公开形式'", workerID, task.group.DocTitle)
 							} else {
-								log.Printf("[工作协程 #%d] ✅ 文档 %s 检查完成，不包含'公开形式'", workerID, task.group.DocTitle)
+								logger.Info("[工作协程 #%d] ✅ 文档 %s 检查完成，不包含'公开形式'", workerID, task.group.DocTitle)
 							}
 						default:
 							// channel已关闭或已满，记录警告
-							log.Printf("⚠️ [工作协程 #%d] 无法发送检查结果: %s", workerID, task.group.DocTitle)
+							logger.Info("⚠️ [工作协程 #%d] 无法发送检查结果: %s", workerID, task.group.DocTitle)
 						}
 					} else {
 						// 完全异步模式，不发送结果，只记录日志
 						if task.group.HasPublicForm {
-							log.Printf("[工作协程 #%d] ✅ 文档 %s 异步检查完成，包含'公开形式'（完全异步模式）", workerID, task.group.DocTitle)
+							logger.Info("[工作协程 #%d] ✅ 文档 %s 异步检查完成，包含'公开形式'（完全异步模式）", workerID, task.group.DocTitle)
 						} else {
-							log.Printf("[工作协程 #%d] ✅ 文档 %s 异步检查完成，不包含'公开形式'（完全异步模式）", workerID, task.group.DocTitle)
+							logger.Info("[工作协程 #%d] ✅ 文档 %s 异步检查完成，不包含'公开形式'（完全异步模式）", workerID, task.group.DocTitle)
 						}
 					}
 				}()
 			}
-			log.Printf("异步检查工作协程 #%d 已退出", workerID)
+			logger.Info("异步检查工作协程 #%d 已退出", workerID)
 		}(i)
 	}
-	log.Printf("已启动 %d 个异步检查工作协程", s.checkWorkers)
+	logger.Info("已启动 %d 个异步检查工作协程", s.checkWorkers)
 }
 
 // checkPublicFormSync 同步检查文档是否包含"公开形式"（实时检查，不使用缓存）
@@ -2124,9 +2124,9 @@ func (s *Server) checkPublicFormSync(group *DocGroup) {
 		// TXT文件：读取最后100字节
 		if fileContent, err := readFileLastBytes(filePath, maxCheckLength); err == nil {
 			contentToCheck = fileContent
-			log.Printf("[检查] TXT文件 %s 读取的最后%d个字符，实际长度: %d", group.DocTitle, maxCheckLength, len(contentToCheck))
+			logger.Info("[检查] TXT文件 %s 读取的最后%d个字符，实际长度: %d", group.DocTitle, maxCheckLength, len(contentToCheck))
 		} else {
-			log.Printf("[检查] TXT文件 %s 读取失败: %v", group.DocTitle, err)
+			logger.Error("[检查] TXT文件 %s 读取失败: %v", group.DocTitle, err)
 		}
 	} else if fileTypeLower == "pdf" || fileTypeLower == "doc" || fileTypeLower == "docx" {
 		// PDF/Word文档：加载最后一页的内容（最多100字符）
@@ -2137,9 +2137,9 @@ func (s *Server) checkPublicFormSync(group *DocGroup) {
 			} else {
 				contentToCheck = lastContent
 			}
-			log.Printf("[检查] %s文件 %s 读取最后一页的最后%d个字符，实际长度: %d", strings.ToUpper(fileTypeLower), group.DocTitle, maxCheckLength, len(contentToCheck))
+			logger.Info("[检查] %s文件 %s 读取最后一页的最后%d个字符，实际长度: %d", strings.ToUpper(fileTypeLower), group.DocTitle, maxCheckLength, len(contentToCheck))
 		} else {
-			log.Printf("[检查] %s文件 %s 读取失败: %v", strings.ToUpper(fileTypeLower), group.DocTitle, err)
+			logger.Error("[检查] %s文件 %s 读取失败: %v", strings.ToUpper(fileTypeLower), group.DocTitle, err)
 		}
 	}
 
@@ -2149,9 +2149,9 @@ func (s *Server) checkPublicFormSync(group *DocGroup) {
 	
 	// 记录检查结果，方便调试
 	if hasPublicForm {
-		log.Printf("[检查结果] ✅ 文档 %s 包含'公开形式'，不允许下载", group.DocTitle)
+		logger.Info("[检查结果] ✅ 文档 %s 包含'公开形式'，不允许下载", group.DocTitle)
 	} else {
-		log.Printf("[检查结果] ✅ 文档 %s 不包含'公开形式'，允许下载", group.DocTitle)
+		logger.Info("[检查结果] ✅ 文档 %s 不包含'公开形式'，允许下载", group.DocTitle)
 	}
 }
 

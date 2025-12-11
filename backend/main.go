@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +13,7 @@ import (
 	"github.com/Codeyangyi/personal-ai-kb/embedding"
 	"github.com/Codeyangyi/personal-ai-kb/llm"
 	"github.com/Codeyangyi/personal-ai-kb/loader"
+	"github.com/Codeyangyi/personal-ai-kb/logger"
 	"github.com/Codeyangyi/personal-ai-kb/rag"
 	"github.com/Codeyangyi/personal-ai-kb/splitter"
 	"github.com/Codeyangyi/personal-ai-kb/store"
@@ -38,20 +38,34 @@ func main() {
 	// 加载配置
 	cfg := config.LoadConfig()
 	if err := cfg.Validate(); err != nil {
-		log.Fatalf("配置错误: %v", err)
+		// 在日志系统初始化前，使用标准 log
+		fmt.Fprintf(os.Stderr, "配置错误: %v\n", err)
+		os.Exit(1)
 	}
+
+	// 初始化日志系统
+	logLevel := logger.ParseLevel(cfg.LogLevel)
+	if err := logger.Init(cfg.LogDir, logLevel, cfg.LogConsole); err != nil {
+		fmt.Fprintf(os.Stderr, "初始化日志系统失败: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := logger.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "关闭日志文件失败: %v\n", err)
+		}
+	}()
 
 	// 如果没有指定mode，使用配置文件中的默认值
 	if *mode == "" {
 		*mode = cfg.ServerMode
-		log.Printf("使用配置的默认模式: %s (可通过 -mode 参数或 SERVER_MODE 环境变量修改)", *mode)
+		logger.Info("使用配置的默认模式: %s (可通过 -mode 参数或 SERVER_MODE 环境变量修改)", *mode)
 	}
 
 	// 如果没有指定port，使用配置文件中的默认值
 	if *port == "" {
 		*port = cfg.ServerPort
 		if *mode == "server" {
-			log.Printf("使用配置的默认端口: %s (可通过 -port 参数或 SERVER_PORT 环境变量修改)", *port)
+			logger.Info("使用配置的默认端口: %s (可通过 -port 参数或 SERVER_PORT 环境变量修改)", *port)
 		}
 	}
 
@@ -64,13 +78,13 @@ func main() {
 		cfg.SiliconFlowAPIKey,
 	)
 	if err != nil {
-		log.Fatalf("创建嵌入向量生成器失败: %v", err)
+		logger.Fatal("创建嵌入向量生成器失败: %v", err)
 	}
 
 	// 创建向量存储（会自动创建集合如果不存在）
 	vectorStore, err := store.NewQdrantStore(cfg.QdrantURL, cfg.QdrantAPIKey, cfg.CollectionName, embedder.GetEmbedder(), embedder)
 	if err != nil {
-		log.Fatalf("创建向量存储失败: %v", err)
+		logger.Fatal("创建向量存储失败: %v", err)
 	}
 
 	// 创建LLM客户端（根据配置选择Ollama、通义千问或Kimi2）
@@ -79,23 +93,23 @@ func main() {
 		// 使用通义千问
 		llmClient, err = llm.NewDashScopeLLM(cfg.DashScopeAPIKey, cfg.DashScopeModel)
 		if err != nil {
-			log.Fatalf("创建通义千问客户端失败: %v", err)
+			logger.Fatal("创建通义千问客户端失败: %v", err)
 		}
-		log.Printf("使用通义千问模型: %s", cfg.DashScopeModel)
+		logger.Info("使用通义千问模型: %s", cfg.DashScopeModel)
 	} else if cfg.LLMProvider == "kimi" {
 		// 使用Kimi2
 		llmClient, err = llm.NewKimiLLM(cfg.MoonshotAPIKey, cfg.MoonshotModel)
 		if err != nil {
-			log.Fatalf("创建Kimi2客户端失败: %v", err)
+			logger.Fatal("创建Kimi2客户端失败: %v", err)
 		}
-		log.Printf("使用Kimi2模型: %s", cfg.MoonshotModel)
+		logger.Info("使用Kimi2模型: %s", cfg.MoonshotModel)
 	} else {
 		// 使用Ollama
 		llmClient, err = llm.NewOllamaLLM(cfg.OllamaBaseURL, cfg.OllamaModel)
 		if err != nil {
-			log.Fatalf("创建Ollama客户端失败: %v", err)
+			logger.Fatal("创建Ollama客户端失败: %v", err)
 		}
-		log.Printf("使用Ollama模型: %s", cfg.OllamaModel)
+		logger.Info("使用Ollama模型: %s", cfg.OllamaModel)
 	}
 
 	// 创建RAG系统
@@ -107,7 +121,7 @@ func main() {
 	case "load":
 		// 加载文档模式
 		if *filePath == "" && *url == "" {
-			log.Fatal("请指定要加载的文件路径 (-file) 或URL (-url)")
+			logger.Fatal("请指定要加载的文件路径 (-file) 或URL (-url)")
 		}
 
 		var docs []schema.Document
@@ -125,7 +139,7 @@ func main() {
 		}
 
 		if err != nil {
-			log.Fatalf("加载文档失败: %v", err)
+			logger.Fatal("加载文档失败: %v", err)
 		}
 
 		fmt.Printf("已加载 %d 个文档\n", len(docs))
@@ -147,7 +161,7 @@ func main() {
 		textSplitter := splitter.NewTextSplitter(actualChunkSize, actualOverlap)
 		chunks, err := textSplitter.SplitDocuments(docs)
 		if err != nil {
-			log.Fatalf("切分文档失败: %v", err)
+			logger.Fatal("切分文档失败: %v", err)
 		}
 
 		fmt.Printf("已切分为 %d 个文本块\n", len(chunks))
@@ -155,7 +169,7 @@ func main() {
 		// 添加到知识库
 		fmt.Printf("正在向量化并存储到知识库... (共 %d 个文本块)\n", len(chunks))
 		if err := ragSystem.AddDocuments(ctx, chunks); err != nil {
-			log.Fatalf("添加到知识库失败: %v", err)
+			logger.Fatal("添加到知识库失败: %v", err)
 		}
 
 	case "query":
@@ -184,6 +198,7 @@ func main() {
 				fmt.Println("正在查询...")
 				answer, err := ragSystem.Query(ctx, input)
 				if err != nil {
+					logger.Error("查询失败: %v", err)
 					fmt.Printf("查询失败: %v\n", err)
 					continue
 				}
@@ -196,7 +211,7 @@ func main() {
 			fmt.Println("正在查询...")
 			answer, err := ragSystem.Query(ctx, *question)
 			if err != nil {
-				log.Fatalf("查询失败: %v", err)
+				logger.Fatal("查询失败: %v", err)
 			}
 			fmt.Printf("\n回答: %s\n", answer)
 		}
@@ -204,16 +219,16 @@ func main() {
 	case "load-dir":
 		// 批量加载目录中的文档
 		if *filePath == "" {
-			log.Fatal("请指定要加载的目录路径 (-file)")
+			logger.Fatal("请指定要加载的目录路径 (-file)")
 		}
 
 		dir := *filePath
 		fileInfo, err := os.Stat(dir)
 		if err != nil {
-			log.Fatalf("无法访问目录: %v", err)
+			logger.Fatal("无法访问目录: %v", err)
 		}
 		if !fileInfo.IsDir() {
-			log.Fatal("指定的路径不是目录")
+			logger.Fatal("指定的路径不是目录")
 		}
 
 		// 支持的文档类型
@@ -274,27 +289,27 @@ func main() {
 		})
 
 		if err != nil {
-			log.Fatalf("遍历目录失败: %v", err)
+			logger.Fatal("遍历目录失败: %v", err)
 		}
 
 		fmt.Printf("\n共加载 %d 个文本块\n", len(allChunks))
 		fmt.Println("正在向量化并存储到知识库...")
 
 		if err := ragSystem.AddDocuments(ctx, allChunks); err != nil {
-			log.Fatalf("添加到知识库失败: %v", err)
+			logger.Fatal("添加到知识库失败: %v", err)
 		}
 
 	case "server":
 		// 启动API服务器模式
 		server, err := api.NewServer(cfg)
 		if err != nil {
-			log.Fatalf("创建API服务器失败: %v", err)
+			logger.Fatal("创建API服务器失败: %v", err)
 		}
 		if err := server.Start(*port); err != nil {
-			log.Fatalf("启动API服务器失败: %v", err)
+			logger.Fatal("启动API服务器失败: %v", err)
 		}
 
 	default:
-		log.Fatalf("未知模式: %s. 支持的模式: load, query, load-dir, server", *mode)
+		logger.Fatal("未知模式: %s. 支持的模式: load, query, load-dir, server", *mode)
 	}
 }

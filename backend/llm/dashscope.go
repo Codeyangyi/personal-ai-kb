@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"github.com/Codeyangyi/personal-ai-kb/logger"
 )
 
 // DashScopeLLM 通义千问大语言模型客户端
@@ -115,7 +117,7 @@ func (d *DashScopeLLM) Generate(ctx context.Context, prompt string) (string, err
 	}
 
 	// 调试：记录请求信息（不记录完整prompt，可能很长）
-	fmt.Printf("[DashScope] 调用模型: %s, prompt长度: %d 字符\n", d.model, len(prompt))
+	logger.Debug("[DashScope] 调用模型: %s, prompt长度: %d 字符\n", d.model, len(prompt))
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
@@ -151,12 +153,12 @@ func (d *DashScopeLLM) Generate(ctx context.Context, prompt string) (string, err
 		if err := json.Unmarshal(body, &errorResp); err == nil {
 			if code, ok := errorResp["code"].(string); ok {
 				if message, ok := errorResp["message"].(string); ok {
-					fmt.Printf("[DashScope] API错误 [%s]: %s\n", code, message)
+					logger.Debug("[DashScope] API错误 [%s]: %s\n", code, message)
 					return "", fmt.Errorf("DashScope API错误 [%s]: %s", code, message)
 				}
 			}
 		}
-		fmt.Printf("[DashScope] HTTP错误 %d: %s\n", resp.StatusCode, string(body))
+		logger.Debug("[DashScope] HTTP错误 %d: %s\n", resp.StatusCode, string(body))
 		return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -184,18 +186,18 @@ func (d *DashScopeLLM) Generate(ctx context.Context, prompt string) (string, err
 	}
 
 	// 调试：显示LLM响应的详细信息
-	fmt.Printf("[DashScope] 收到响应 - 答案长度: %d 字符, 完成原因: %s\n", len(answer), finishReason)
+	logger.Debug("[DashScope] 收到响应 - 答案长度: %d 字符, 完成原因: %s\n", len(answer), finishReason)
 	if dashScopeResp.Usage.InputTokens > 0 || dashScopeResp.Usage.OutputTokens > 0 {
 		totalTokens := dashScopeResp.Usage.InputTokens + dashScopeResp.Usage.OutputTokens
-		fmt.Printf("[DashScope] Token使用 - 输入: %d, 输出: %d, 总计: %d\n",
+		logger.Debug("[DashScope] Token使用 - 输入: %d, 输出: %d, 总计: %d\n",
 			dashScopeResp.Usage.InputTokens, dashScopeResp.Usage.OutputTokens, totalTokens)
 	}
 
 	// 调试：显示答案预览（前300字符）
 	if len(answer) > 300 {
-		fmt.Printf("[DashScope] 答案预览: %s...\n", answer[:300])
+		logger.Debug("[DashScope] 答案预览: %s...\n", answer[:300])
 	} else {
-		fmt.Printf("[DashScope] 完整答案: %s\n", answer)
+		logger.Debug("[DashScope] 完整答案: %s\n", answer)
 	}
 
 	return answer, nil
