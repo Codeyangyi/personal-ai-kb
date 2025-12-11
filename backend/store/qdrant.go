@@ -366,3 +366,85 @@ func (s *QdrantStore) SearchWithScore(ctx context.Context, query string, embedde
 
 	return searchResults, nil
 }
+
+// DeleteDocumentsBySource 根据source字段删除文档
+// sourcePath 可以是完整路径或部分路径，会匹配所有包含该路径的文档
+func (s *QdrantStore) DeleteDocumentsBySource(ctx context.Context, qdrantURL, apiKey, collectionName, sourcePath string) error {
+	if sourcePath == "" {
+		return nil
+	}
+
+	// 构建删除请求
+	// Qdrant 支持通过 filter 删除匹配条件的 points
+	url := fmt.Sprintf("%s/collections/%s/points/delete", qdrantURL, collectionName)
+
+	// 构建 filter，匹配 source 字段
+	// Qdrant 中 payload 字段的访问方式：使用 key 和 match
+	// 注意：langchaingo 将 metadata 存储在 payload 中
+	filter := map[string]interface{}{
+		"must": []map[string]interface{}{
+			{
+				"key": "source",
+				"match": map[string]interface{}{
+					"value": sourcePath,
+				},
+			},
+		},
+	}
+
+	payload := map[string]interface{}{
+		"filter": filter,
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal delete request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create delete request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		req.Header.Set("api-key", apiKey)
+	}
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send delete request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 读取响应
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read delete response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to delete documents (status %d): %s", resp.StatusCode, string(body))
+	}
+
+	// 解析响应以确认删除结果
+	var deleteResult struct {
+		Result struct {
+			Status string `json:"status"`
+		} `json:"result"`
+		Status *struct {
+			Error *string `json:"error"`
+		} `json:"status"`
+	}
+
+	if err := json.Unmarshal(body, &deleteResult); err == nil {
+		if deleteResult.Result.Status != "" {
+			logger.Info("从向量数据库删除文档成功，source: %s, status: %s", sourcePath, deleteResult.Result.Status)
+		} else if deleteResult.Status != nil && deleteResult.Status.Error != nil {
+			logger.Warn("删除文档时出现警告，source: %s, error: %s", sourcePath, *deleteResult.Status.Error)
+		}
+	}
+
+	return nil
+}

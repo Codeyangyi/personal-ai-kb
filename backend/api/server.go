@@ -69,10 +69,10 @@ type Server struct {
 	failedFilesDir string               // 失败文件目录
 	files          map[string]*FileInfo // 文件ID -> 文件信息
 	db             *sql.DB              // MySQL 连接（用于业务数据，如意见反馈）
-	
+
 	// 异步检查相关
-	checkQueue     chan *checkTaskWithResult // 检查任务队列（包含结果channel）
-	checkWorkers   int                       // 检查工作协程数量
+	checkQueue   chan *checkTaskWithResult // 检查任务队列（包含结果channel）
+	checkWorkers int                       // 检查工作协程数量
 }
 
 // NewServer 创建新的API服务器
@@ -796,7 +796,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}()
-	
+
 	// 提前设置响应头，确保即使发生错误也能正确返回
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 
@@ -1058,13 +1058,13 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		if (fileTypeLower == "pdf" || fileTypeLower == "doc" || fileTypeLower == "docx" || fileTypeLower == "txt") && group.FileID != "" {
 			// 创建结果channel，用于等待检查结果
 			resultChan := make(chan bool, 1)
-			
+
 			// 创建检查任务，放入异步队列
 			checkTask := &checkTaskWithResult{
 				group:      group,
 				resultChan: resultChan,
 			}
-			
+
 			// 尝试放入队列（非阻塞）
 			select {
 			case s.checkQueue <- checkTask:
@@ -1080,13 +1080,13 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			group.HasPublicForm = false
 		}
 	}
-	
+
 	// 异步检查：快速检查已完成的检查结果（非阻塞，等待足够时间确保检查完成）
 	// 平衡：既要避免502错误，又要确保检查完成
 	if len(checkTasks) > 0 {
 		// 使用map跟踪已处理的task，避免重复处理
 		processedTasks := make(map[*DocGroup]bool)
-		
+
 		// 先立即检查一次（可能检查已经完成）
 		completedCount := 0
 		for _, task := range checkTasks {
@@ -1104,25 +1104,25 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 				// 检查未完成，稍后处理
 			}
 		}
-		
+
 		// 如果还有未完成的检查，等待足够的时间（500ms，确保检查能完成）
 		if completedCount < len(checkTasks) {
 			maxWaitTime := 500 * time.Millisecond // 增加到500ms，确保检查完成
 			if len(checkTasks) > 10 {
 				maxWaitTime = 300 * time.Millisecond // 文档多时300ms
 			}
-			
+
 			logger.Info("等待 %d 个文档的检查结果（最多等待%v）...", len(checkTasks)-completedCount, maxWaitTime)
-			
+
 			// 使用带超时的select，非阻塞等待
 			timeout := time.NewTimer(maxWaitTime)
 			defer timeout.Stop()
-			
+
 			// 每50ms检查一次，直到超时或全部完成
 			ticker := time.NewTicker(50 * time.Millisecond)
 			defer ticker.Stop()
-			
-			waitLoop:
+
+		waitLoop:
 			for completedCount < len(checkTasks) {
 				select {
 				case <-timeout.C:
@@ -1151,13 +1151,13 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		
+
 		// 处理未完成的检查，使用更安全的默认值（不允许下载，更安全）
 		for _, task := range checkTasks {
 			if processedTasks[task.group] {
 				continue // 已处理
 			}
-			
+
 			// 尝试最后一次读取
 			select {
 			case hasPublicForm := <-task.resultChan:
@@ -1175,10 +1175,10 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 				logger.Info("⏳ 文档 %s 检查未完成，使用安全默认值：不允许下载（检查在后台继续）", task.group.DocTitle)
 			}
 		}
-		
+
 		logger.Info("检查结果收集完成，完成: %d/%d（异步检查，不阻塞主请求）", completedCount, len(checkTasks))
 	}
-	
+
 	logger.Info("所有文档检查处理完成，立即返回响应")
 
 	// 按原始顺序添加到docGroups（完全异步，不等待检查结果）
@@ -1188,7 +1188,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			logger.Error("⚠️ 构建响应数据时发生panic: %v, 堆栈: %s", r, getStackTrace())
 		}
 	}()
-	
+
 	// 直接使用docGroupsMap构建响应（检查在后台异步进行）
 	for _, group := range docGroupsMap {
 		docGroups = append(docGroups, *group)
@@ -1204,22 +1204,22 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		logger.Info("⚠️ 文档组数量过多 (%d > %d)，只返回前 %d 个", len(docGroups), maxDocGroups, maxDocGroups)
 		limitedDocGroups = docGroups[:maxDocGroups]
 	}
-	
+
 	// 限制每个文档组的chunks数量，避免响应过大
 	// 同时限制每个chunk的内容长度，避免单个chunk过大
 	const maxChunksPerGroup = 20
 	const maxChunkContentLength = 2000 // 每个chunk最多2000字符
-	
+
 	totalChunksBefore := 0
 	for i := range limitedDocGroups {
 		totalChunksBefore += len(limitedDocGroups[i].Chunks)
-		
+
 		// 限制chunks数量
 		if len(limitedDocGroups[i].Chunks) > maxChunksPerGroup {
 			logger.Info("⚠️ 文档 %s 的chunks数量过多 (%d > %d)，只返回前 %d 个", limitedDocGroups[i].DocTitle, len(limitedDocGroups[i].Chunks), maxChunksPerGroup, maxChunksPerGroup)
 			limitedDocGroups[i].Chunks = limitedDocGroups[i].Chunks[:maxChunksPerGroup]
 		}
-		
+
 		// 限制每个chunk的内容长度
 		for j := range limitedDocGroups[i].Chunks {
 			chunk := limitedDocGroups[i].Chunks[j]
@@ -1236,7 +1236,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		totalChunksAfter += len(g.Chunks)
 	}
 	logger.Info("响应数据限制完成，文档组数: %d, 总chunks数: %d -> %d", len(limitedDocGroups), totalChunksBefore, totalChunksAfter)
-	
+
 	// 构建响应数据，添加错误处理
 	var response map[string]interface{}
 	func() {
@@ -1253,8 +1253,8 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}()
 		response = map[string]interface{}{
 			"answer":    queryResult.Answer,
-			"results":   searchResults, // 平铺格式（兼容旧前端）
-			"docGroups": limitedDocGroups,     // 按文档分组的格式（新格式）
+			"results":   searchResults,    // 平铺格式（兼容旧前端）
+			"docGroups": limitedDocGroups, // 按文档分组的格式（新格式）
 		}
 	}()
 	logger.Info("响应数据构建完成，准备编码JSON，answer长度: %d, results数量: %d, docGroups数量: %d", len(queryResult.Answer), len(searchResults), len(limitedDocGroups))
@@ -1262,7 +1262,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	// 设置响应头，确保即使编码失败也能正确返回
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-	
+
 	// 提前发送响应头，避免502错误（在Ubuntu/Nginx环境下很重要）
 	// 这样即使后续处理出现问题，客户端也能知道请求已收到
 	if flusher, ok := w.(http.Flusher); ok {
@@ -1284,17 +1284,17 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	
+
 	// 记录响应大小，用于监控
 	responseSize := len(queryResult.Answer) + len(limitedDocGroups)*100 // 粗略估算
 	logger.Info("准备发送响应，答案长度: %d 字符, 文档组数: %d, 估算响应大小: %d 字节", len(queryResult.Answer), len(limitedDocGroups), responseSize)
-	
+
 	// 检查客户端连接是否已关闭
 	if r.Context().Err() != nil {
 		logger.Info("⚠️ 客户端连接已关闭: %v, 问题: %s", r.Context().Err(), req.Question)
 		return
 	}
-	
+
 	// 编码响应，确保错误处理
 	// 使用缓冲写入，避免大响应导致问题
 	logger.Info("开始编码JSON响应...")
@@ -1312,10 +1312,10 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}()
-	
+
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "") // 不格式化，减少响应大小
-	
+
 	if err := encoder.Encode(response); err != nil {
 		logger.Error("⚠️ 编码查询响应失败: %v, 问题: %s, 错误类型: %T", err, req.Question, err)
 		// 如果编码失败，尝试返回一个简单的错误响应
@@ -1331,9 +1331,9 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	
+
 	logger.Info("JSON编码完成，准备刷新响应...")
-	
+
 	// 尝试刷新响应（如果支持），确保数据及时发送，避免超时导致502
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
@@ -1352,7 +1352,7 @@ func loadDocumentLastPart(filePath string, fileType string, maxChars int) (strin
 	if maxChars <= 0 {
 		maxChars = 100 // 默认只加载最后100个字符
 	}
-	
+
 	// 创建带超时的context（1.5秒），避免大文件加载时间过长
 	// 进一步减少超时时间，最小化CPU占用
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
@@ -1824,8 +1824,65 @@ func (s *Server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 	// 从Qdrant向量数据库中删除相关文档
 	// 通过metadata中的source字段匹配文件路径
 	ctx := context.Background()
-	if err := s.deleteDocumentsBySource(ctx, filePath); err != nil {
-		logger.Error("从向量数据库删除文档失败: %v", err)
+
+	// 构建待匹配的所有可能路径（无论磁盘上是否仍存在文件，都需要尝试删除向量数据）
+	pathSet := make(map[string]struct{})
+	addPath := func(p string) {
+		if p == "" {
+			return
+		}
+		if _, exists := pathSet[p]; exists {
+			return
+		}
+		pathSet[p] = struct{}{}
+	}
+
+	// 原始保存路径（新旧两种命名格式）
+	addPath(newFormatPath)
+	addPath(oldFormatPath)
+
+	// 绝对路径 & 相对路径（相对 filesDir）
+	for _, p := range []string{newFormatPath, oldFormatPath} {
+		if p == "" {
+			continue
+		}
+		if abs, err := filepath.Abs(p); err == nil {
+			addPath(abs)
+		} else {
+			addPath(p)
+		}
+		if rel, err := filepath.Rel(s.filesDir, p); err == nil {
+			addPath(rel)
+		}
+
+		// 同一路径的正斜杠版本，避免路径分隔符差异导致匹配失败
+		addPath(filepath.ToSlash(p))
+		if abs, err := filepath.Abs(p); err == nil {
+			addPath(filepath.ToSlash(abs))
+		}
+		if rel, err := filepath.Rel(s.filesDir, p); err == nil {
+			addPath(filepath.ToSlash(rel))
+		}
+	}
+
+	// 基础文件名和原始文件名（兼容仅存储文件名的情况）
+	addPath(filepath.Base(newFormatPath))
+	addPath(filepath.Base(oldFormatPath))
+	addPath(fileInfo.Filename)
+
+	var deleteErr error
+	successfulPath := ""
+	for p := range pathSet {
+		deleteErr = s.store.DeleteDocumentsBySource(ctx, s.config.QdrantURL, s.config.QdrantAPIKey, s.config.CollectionName, p)
+		if deleteErr == nil {
+			successfulPath = p
+			// 继续尝试其他形式，确保不同存储格式的残留也被清理
+			logger.Info("已从向量数据库删除文件相关文档，匹配路径: %s", p)
+		}
+	}
+
+	if successfulPath == "" && deleteErr != nil {
+		logger.Error("从向量数据库删除文档失败（已尝试多种路径格式）: %v", deleteErr)
 		// 即使删除向量数据库中的文档失败，也返回成功（因为文件已删除）
 	}
 
@@ -1834,26 +1891,6 @@ func (s *Server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"message": fmt.Sprintf("文件 %s 已删除", fileInfo.Filename),
 	})
-}
-
-// deleteDocumentsBySource 从Qdrant中删除指定source的文档
-func (s *Server) deleteDocumentsBySource(ctx context.Context, sourcePath string) error {
-	if sourcePath == "" {
-		return nil
-	}
-
-	// 使用Qdrant的API删除文档
-	// 注意：langchaingo的Qdrant实现可能不直接支持按metadata删除
-	// 这里我们需要直接调用Qdrant的API
-	// 由于Qdrant的删除需要point ID，我们需要先查询所有匹配的point，然后删除
-
-	// 简化实现：由于langchaingo的Qdrant包装器不直接支持按metadata删除
-	// 这里我们只记录日志，实际删除可以通过Qdrant的API实现
-	// 或者，我们可以重新构建整个知识库（删除所有，然后重新添加其他文件）
-	// 为了简化，这里先只删除文件，向量数据库中的文档可以保留（不影响功能）
-
-	logger.Info("注意：向量数据库中的文档（source=%s）需要手动清理或通过Qdrant API删除", sourcePath)
-	return nil
 }
 
 // handleFeedback 处理意见反馈提交，将数据写入 MySQL
@@ -2047,11 +2084,11 @@ func (s *Server) startAsyncCheckWorkers() {
 							}
 						}
 					}()
-					
+
 					// 执行检查
 					logger.Info("[工作协程 #%d] 开始检查文档: %s (FileID: %s)", workerID, task.group.DocTitle, task.group.FileID)
 					s.checkPublicFormAsync(task.group)
-					
+
 					// 发送结果（如果resultChan存在，完全异步模式下为nil）
 					if task.resultChan != nil {
 						select {
@@ -2146,7 +2183,7 @@ func (s *Server) checkPublicFormSync(group *DocGroup) {
 	// 检查是否包含"公开形式"
 	hasPublicForm := checkPublicFormInContent(contentToCheck)
 	group.HasPublicForm = hasPublicForm
-	
+
 	// 记录检查结果，方便调试
 	if hasPublicForm {
 		logger.Info("[检查结果] ✅ 文档 %s 包含'公开形式'，不允许下载", group.DocTitle)

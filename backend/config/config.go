@@ -39,9 +39,9 @@ type Config struct {
 	MySQLDSN string // 例如: user:password@tcp(127.0.0.1:3306)/dbname?charset=utf8mb4&parseTime=true&loc=Local
 
 	// 日志配置
-	LogDir      string // 日志文件目录
-	LogLevel    string // 日志级别: "debug", "info", "warn", "error"
-	LogConsole  bool   // 是否同时输出到控制台
+	LogDir     string // 日志文件目录
+	LogLevel   string // 日志级别: "debug", "info", "warn", "error"
+	LogConsole bool   // 是否同时输出到控制台
 }
 
 // LoadConfig 从环境变量加载配置
@@ -86,9 +86,9 @@ func LoadConfig() *Config {
 		//MySQLDSN: getEnv("MYSQL_DSN", "personal-ai-kb:6mcETznRjwdmK7XN@tcp(127.0.0.1:3306)/ai_kb?charset=utf8mb4"),
 
 		// 日志配置
-		LogDir:     getEnv("LOG_DIR", "./logs"),                    // 默认日志目录为 ./logs
-		LogLevel:   getEnv("LOG_LEVEL", "info"),                    // 默认日志级别为 info
-		LogConsole: getEnv("LOG_CONSOLE", "true") == "true",        // 默认同时输出到控制台
+		LogDir:     getEnv("LOG_DIR", "./logs"),             // 默认日志目录为 ./logs
+		LogLevel:   getEnv("LOG_LEVEL", "info"),             // 默认日志级别为 info
+		LogConsole: getEnv("LOG_CONSOLE", "true") == "true", // 默认同时输出到控制台
 	}
 }
 
