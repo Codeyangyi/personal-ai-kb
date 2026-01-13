@@ -20,6 +20,7 @@ import (
 	"github.com/Codeyangyi/personal-ai-kb/llm"
 	"github.com/Codeyangyi/personal-ai-kb/loader"
 	"github.com/Codeyangyi/personal-ai-kb/logger"
+	"github.com/Codeyangyi/personal-ai-kb/ocr"
 	"github.com/Codeyangyi/personal-ai-kb/rag"
 	"github.com/Codeyangyi/personal-ai-kb/splitter"
 	"github.com/Codeyangyi/personal-ai-kb/store"
@@ -57,7 +58,7 @@ type checkTaskWithResult struct {
 	resultChan chan bool
 }
 
-// Server HTTP API服务器
+	// Server HTTP API服务器
 type Server struct {
 	ragSystem      *rag.RAG
 	config         *config.Config
@@ -69,6 +70,7 @@ type Server struct {
 	failedFilesDir string               // 失败文件目录
 	files          map[string]*FileInfo // 文件ID -> 文件信息
 	db             *sql.DB              // MySQL 连接（用于业务数据，如意见反馈）
+	ocrProcessor   *ocr.OCRProcessor    // OCR处理器（纯Go实现，用于处理扫描件PDF）
 
 	// 异步检查相关
 	checkQueue   chan *checkTaskWithResult // 检查任务队列（包含结果channel）
@@ -170,6 +172,16 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("创建失败文件存储目录失败: %v", err)
 	}
 
+	// 创建OCR处理器（纯Go实现，如果配置了DashScope API Key）
+	var ocrProcessor *ocr.OCRProcessor
+	if cfg.DashScopeAPIKey != "" {
+		dashScopeOCR := ocr.NewDashScopeOCR(cfg.DashScopeAPIKey)
+		ocrProcessor = ocr.NewOCRProcessor(dashScopeOCR)
+		logger.Info("OCR功能已启用（纯Go实现），支持处理扫描版PDF")
+	} else {
+		logger.Info("未配置DASHSCOPE_API_KEY，OCR功能未启用，无法处理扫描版PDF")
+	}
+
 	server := &Server{
 		ragSystem:      ragSystem,
 		config:         cfg,
@@ -181,6 +193,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		failedFilesDir: failedFilesDir,
 		files:          make(map[string]*FileInfo),
 		db:             db,
+		ocrProcessor:   ocrProcessor,
 		checkQueue:     make(chan *checkTaskWithResult, 100), // 检查任务队列，缓冲区100
 		checkWorkers:   3,                                    // 3个工作协程处理检查任务
 	}
@@ -399,8 +412,13 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 加载文档
-	fileLoader := loader.NewFileLoader()
+	// 加载文档（使用带OCR支持的文件加载器，纯Go实现）
+	var fileLoader *loader.FileLoader
+	if s.ocrProcessor != nil {
+		fileLoader = loader.NewFileLoaderWithOCR(s.ocrProcessor)
+	} else {
+		fileLoader = loader.NewFileLoader()
+	}
 	docs, err := fileLoader.Load(savedPath)
 	if err != nil {
 		// 优化：提供更友好的错误信息（与批量上传保持一致）
@@ -464,9 +482,40 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 过滤掉内容为空的chunks（只保留有实际文本内容的chunks）
+	validChunks := make([]schema.Document, 0, len(chunks))
+	for _, chunk := range chunks {
+		content := strings.TrimSpace(chunk.PageContent)
+		if len(content) > 0 {
+			validChunks = append(validChunks, chunk)
+		}
+	}
+
+	// 检查是否有有效的chunks
+	if len(validChunks) == 0 {
+		failureReason := "文件加载成功但未提取到任何有效文本内容。可能是扫描版PDF（纯图片）或文件内容为空，请使用OCR工具提取文本后再上传"
+		logger.Warn("文件 %s 切分后没有有效内容，原始chunks数量: %d", header.Filename, len(chunks))
+		if saveErr := s.saveFailedFile(savedPath, header.Filename, failureReason); saveErr != nil {
+			logger.Error("保存失败文件时出错: %v", saveErr)
+			os.Remove(savedPath)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":  false,
+			"message":  failureReason,
+			"filename": header.Filename,
+		})
+		return
+	}
+
+	// 如果过滤后chunks数量减少，记录警告
+	if len(validChunks) < len(chunks) {
+		logger.Warn("文件 %s 过滤掉 %d 个空chunks，保留 %d 个有效chunks", header.Filename, len(chunks)-len(validChunks), len(validChunks))
+	}
+
 	// 添加到知识库
 	ctx := context.Background()
-	if err := s.ragSystem.AddDocuments(ctx, chunks); err != nil {
+	if err := s.ragSystem.AddDocuments(ctx, validChunks); err != nil {
 		// 向量化失败：保存失败文件到失败目录
 		failureReason := fmt.Sprintf("向量化失败: %v", err)
 		if saveErr := s.saveFailedFile(savedPath, header.Filename, failureReason); saveErr != nil {
@@ -491,15 +540,15 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		Content:    contentPreview,
 		Size:       fileSize,
 		UploadedAt: time.Now(),
-		Chunks:     len(chunks),
+		Chunks:     len(validChunks),
 	}
 	s.files[fileID] = fileInfo
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":  true,
-		"message":  fmt.Sprintf("成功上传并处理文件: %s，共 %d 个文本块", header.Filename, len(chunks)),
-		"chunks":   len(chunks),
+		"message":  fmt.Sprintf("成功上传并处理文件: %s，共 %d 个文本块", header.Filename, len(validChunks)),
+		"chunks":   len(validChunks),
 		"fileId":   fileID,
 		"filename": header.Filename,
 	})
@@ -532,7 +581,13 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fileLoader := loader.NewFileLoader()
+	// 创建文件加载器（使用带OCR支持的文件加载器，纯Go实现）
+	var fileLoader *loader.FileLoader
+	if s.ocrProcessor != nil {
+		fileLoader = loader.NewFileLoaderWithOCR(s.ocrProcessor)
+	} else {
+		fileLoader = loader.NewFileLoader()
+	}
 	textSplitter := splitter.NewTextSplitter(s.config.ChunkSize, s.config.ChunkOverlap)
 
 	type FileResult struct {
@@ -687,8 +742,39 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		allChunks = append(allChunks, chunks...)
-		logger.Info("文件 %s 处理成功，生成 %d 个文本块，累计 %d 个文本块", fileHeader.Filename, len(chunks), len(allChunks))
+		// 过滤掉内容为空的chunks（只保留有实际文本内容的chunks）
+		validChunks := make([]schema.Document, 0, len(chunks))
+		for _, chunk := range chunks {
+			content := strings.TrimSpace(chunk.PageContent)
+			if len(content) > 0 {
+				validChunks = append(validChunks, chunk)
+			}
+		}
+
+		// 检查是否有有效的chunks
+		if len(validChunks) == 0 {
+			failureReason := "文件加载成功但未提取到任何有效文本内容。可能是扫描版PDF（纯图片）或文件内容为空，请使用OCR工具提取文本后再上传"
+			logger.Warn("文件 %s 切分后没有有效内容，原始chunks数量: %d", fileHeader.Filename, len(chunks))
+			if saveErr := s.saveFailedFile(savedPath, fileHeader.Filename, failureReason); saveErr != nil {
+				logger.Error("保存失败文件时出错: %v", saveErr)
+				os.Remove(savedPath)
+			}
+			results = append(results, FileResult{
+				Filename: fileHeader.Filename,
+				Success:  false,
+				Message:  failureReason,
+			})
+			failCount++
+			continue
+		}
+
+		// 如果过滤后chunks数量减少，记录警告
+		if len(validChunks) < len(chunks) {
+			logger.Warn("文件 %s 过滤掉 %d 个空chunks，保留 %d 个有效chunks", fileHeader.Filename, len(chunks)-len(validChunks), len(validChunks))
+		}
+
+		allChunks = append(allChunks, validChunks...)
+		logger.Info("文件 %s 处理成功，生成 %d 个有效文本块（原始 %d 个），累计 %d 个文本块", fileHeader.Filename, len(validChunks), len(chunks), len(allChunks))
 
 		// 保存文件信息
 		fileInfo := &FileInfo{
@@ -698,15 +784,15 @@ func (s *Server) handleBatchUpload(w http.ResponseWriter, r *http.Request) {
 			Content:    contentPreview,
 			Size:       fileSize,
 			UploadedAt: time.Now(),
-			Chunks:     len(chunks),
+			Chunks:     len(validChunks),
 		}
 		s.files[fileID] = fileInfo
 
 		results = append(results, FileResult{
 			Filename: fileHeader.Filename,
 			Success:  true,
-			Message:  fmt.Sprintf("成功处理，共 %d 个文本块", len(chunks)),
-			Chunks:   len(chunks),
+			Message:  fmt.Sprintf("成功处理，共 %d 个文本块", len(validChunks)),
+			Chunks:   len(validChunks),
 			FileID:   fileID,
 		})
 		successCount++

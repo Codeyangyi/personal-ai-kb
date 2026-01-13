@@ -11,6 +11,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/Codeyangyi/personal-ai-kb/logger"
+	"github.com/Codeyangyi/personal-ai-kb/ocr"
 	"github.com/nguyenthenguyen/docx"
 	"github.com/tmc/langchaingo/documentloaders"
 	"github.com/tmc/langchaingo/schema"
@@ -22,11 +24,22 @@ type DocumentLoader interface {
 }
 
 // FileLoader 文件加载器
-type FileLoader struct{}
+type FileLoader struct {
+	ocrProcessor *ocr.OCRProcessor
+}
 
 // NewFileLoader 创建新的文件加载器
 func NewFileLoader() *FileLoader {
-	return &FileLoader{}
+	return &FileLoader{
+		ocrProcessor: nil,
+	}
+}
+
+// NewFileLoaderWithOCR 创建带OCR支持的文件加载器
+func NewFileLoaderWithOCR(ocrProcessor *ocr.OCRProcessor) *FileLoader {
+	return &FileLoader{
+		ocrProcessor: ocrProcessor,
+	}
 }
 
 // Load 根据文件类型加载文档
@@ -135,31 +148,72 @@ func (l *FileLoader) Load(path string) ([]schema.Document, error) {
 
 	ctx := context.Background()
 	docs, err := loader.Load(ctx)
-	if err != nil {
-		// 提供更详细的错误信息
-		if ext == ".pdf" {
-			// PDF特定的错误处理
-			errMsg := err.Error()
-			if strings.Contains(errMsg, "encrypted") || strings.Contains(errMsg, "password") {
-				return nil, fmt.Errorf("PDF文件已加密或受密码保护，无法读取。请先移除密码保护后再上传: %w", err)
+	
+	// 如果是PDF文件，自动检测是否为扫描件并处理（纯Go实现）
+	if ext == ".pdf" {
+		// 自动检测PDF是否为扫描件
+		isScanned, scanReason := l.detectScannedPDF(docs, err, path)
+		
+		if isScanned {
+			logger.Info("📄 检测到扫描版PDF: %s (原因: %s)", filepath.Base(path), scanReason)
+			
+			// 如果是扫描件且配置了OCR，自动使用OCR提取文本（纯Go实现）
+			if l.ocrProcessor != nil {
+				logger.Info("🔍 开始使用OCR处理扫描版PDF（纯Go实现）: %s", filepath.Base(path))
+				ocrText, ocrErr := l.ocrProcessor.ProcessPDF(ctx, path)
+				if ocrErr != nil {
+					// OCR失败，返回错误
+					if err != nil {
+						return nil, fmt.Errorf("PDF加载失败且OCR处理失败: 加载错误=%w, OCR错误=%w", err, ocrErr)
+					}
+					return nil, fmt.Errorf("PDF为扫描件但OCR处理失败: %w", ocrErr)
+				}
+				
+				// OCR成功，创建文档对象
+				if ocrText == "" {
+					return nil, fmt.Errorf("OCR处理完成但未提取到任何文本内容")
+				}
+				
+				docs = []schema.Document{
+					{
+						PageContent: ocrText,
+						Metadata: map[string]interface{}{
+							"source":     path,
+							"file_name":  filepath.Base(path),
+							"file_type":  "pdf",
+							"ocr":        true, // 标记为OCR处理的文档
+							"is_scanned": true, // 标记为扫描件
+						},
+					},
+				}
+				logger.Info("✅ OCR处理成功（纯Go实现），提取文本长度: %d字符", len(ocrText))
+			} else {
+				// 是扫描件但没有配置OCR
+				if err != nil {
+					return nil, fmt.Errorf("PDF文件格式异常，可能是扫描版PDF（图片格式）或文件结构不完整。请配置DASHSCOPE_API_KEY环境变量以启用OCR功能: %w", err)
+				}
+				return nil, fmt.Errorf("PDF文件加载成功但未提取到任何文本内容。可能是扫描版PDF（纯图片），请配置DASHSCOPE_API_KEY环境变量以启用OCR功能")
 			}
-			if strings.Contains(errMsg, "corrupt") || strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "malformed") {
-				return nil, fmt.Errorf("PDF文件可能已损坏或格式不正确。请尝试用PDF阅读器打开并重新保存: %w", err)
+		} else {
+			// 不是扫描件，走正常流程
+			if err != nil {
+				// 检查是否是加密或密码保护
+				errMsg := err.Error()
+				if strings.Contains(errMsg, "encrypted") || strings.Contains(errMsg, "password") {
+					return nil, fmt.Errorf("PDF文件已加密或受密码保护，无法读取。请先移除密码保护后再上传: %w", err)
+				}
+				// 检查是否是损坏
+				if strings.Contains(errMsg, "corrupt") || strings.Contains(errMsg, "invalid") || strings.Contains(errMsg, "malformed") {
+					return nil, fmt.Errorf("PDF文件可能已损坏或格式不正确。请尝试用PDF阅读器打开并重新保存: %w", err)
+				}
+				// 其他错误
+				return nil, fmt.Errorf("加载PDF文件失败: %w", err)
 			}
-			if strings.Contains(errMsg, "stream not present") || strings.Contains(errMsg, "stream") {
-				return nil, fmt.Errorf("PDF文件格式异常，可能是扫描版PDF（图片格式）或文件结构不完整。请尝试用PDF阅读器打开并重新保存，或使用OCR工具提取文本: %w", err)
-			}
-			if strings.Contains(errMsg, "EOF") || strings.Contains(errMsg, "unexpected") {
-				return nil, fmt.Errorf("PDF文件解析失败，可能是扫描版PDF（图片格式）或格式不标准。请尝试使用OCR工具提取文本: %w", err)
-			}
-			return nil, fmt.Errorf("加载PDF文件失败: %w。可能的原因：1) PDF文件已加密 2) PDF文件损坏 3) 扫描版PDF（无文本层）4) 格式不标准", err)
+			logger.Info("✅ PDF文件加载成功，提取到文本内容（正常PDF，非扫描件）")
 		}
+	} else if err != nil {
+		// 非PDF文件的错误处理
 		return nil, fmt.Errorf("failed to load documents: %w", err)
-	}
-
-	// 检查PDF是否成功提取到内容
-	if ext == ".pdf" && len(docs) == 0 {
-		return nil, fmt.Errorf("PDF文件加载成功但未提取到任何文本内容。可能是扫描版PDF（纯图片），请使用OCR工具提取文本后再上传")
 	}
 
 	// 添加文件路径作为元数据，并清理文本编码
@@ -175,6 +229,52 @@ func (l *FileLoader) Load(path string) ([]schema.Document, error) {
 	}
 
 	return docs, nil
+}
+
+// detectScannedPDF 检测PDF是否为扫描件（纯Go实现）
+// 返回: (是否为扫描件, 检测原因)
+func (l *FileLoader) detectScannedPDF(docs []schema.Document, loadErr error, path string) (bool, string) {
+	if loadErr != nil {
+		// 加载失败，检查错误类型
+		errMsg := loadErr.Error()
+		// 排除加密、密码保护、损坏等明确不是扫描件的情况
+		if strings.Contains(errMsg, "encrypted") || strings.Contains(errMsg, "password") ||
+			strings.Contains(errMsg, "corrupt") || strings.Contains(errMsg, "invalid") ||
+			strings.Contains(errMsg, "malformed") {
+			return false, "文件错误（加密/损坏），非扫描件"
+		}
+		// 其他加载错误，可能是扫描件
+		return true, "PDF加载失败，可能是扫描件"
+	}
+	
+	if len(docs) == 0 {
+		// 加载成功但没有提取到内容，很可能是扫描件
+		return true, "未提取到任何文本内容"
+	}
+	
+	// 检查提取的文本是否足够
+	totalTextLength := 0
+	nonEmptyDocs := 0
+	for _, doc := range docs {
+		content := strings.TrimSpace(doc.PageContent)
+		if len(content) > 0 {
+			nonEmptyDocs++
+			totalTextLength += len(content)
+		}
+	}
+	
+	// 如果总文本长度少于100字符，可能是扫描件
+	// 或者如果所有文档都是空的，肯定是扫描件
+	if nonEmptyDocs == 0 {
+		return true, "所有页面都未提取到文本内容"
+	}
+	
+	if totalTextLength < 100 {
+		return true, fmt.Sprintf("提取的文本很少（%d字符，%d页有内容）", totalTextLength, nonEmptyDocs)
+	}
+	
+	// 正常PDF，有足够的文本内容
+	return false, fmt.Sprintf("提取到足够的文本内容（%d字符，%d页）", totalTextLength, nonEmptyDocs)
 }
 
 // cleanWordText 清理Word文档文本，去除XML标签和格式标记
