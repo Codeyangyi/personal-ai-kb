@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,12 +21,16 @@ import (
 	"github.com/Codeyangyi/personal-ai-kb/llm"
 	"github.com/Codeyangyi/personal-ai-kb/loader"
 	"github.com/Codeyangyi/personal-ai-kb/logger"
+	"github.com/Codeyangyi/personal-ai-kb/models"
 	"github.com/Codeyangyi/personal-ai-kb/ocr"
 	"github.com/Codeyangyi/personal-ai-kb/rag"
 	"github.com/Codeyangyi/personal-ai-kb/splitter"
 	"github.com/Codeyangyi/personal-ai-kb/store"
 	"github.com/google/uuid"
 	"github.com/tmc/langchaingo/schema"
+	"golang.org/x/crypto/bcrypt"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -58,7 +63,7 @@ type checkTaskWithResult struct {
 	resultChan chan bool
 }
 
-	// Server HTTP API服务器
+// Server HTTP API服务器
 type Server struct {
 	ragSystem      *rag.RAG
 	config         *config.Config
@@ -70,6 +75,7 @@ type Server struct {
 	failedFilesDir string               // 失败文件目录
 	files          map[string]*FileInfo // 文件ID -> 文件信息
 	db             *sql.DB              // MySQL 连接（用于业务数据，如意见反馈）
+	gormDB         *gorm.DB             // GORM 数据库连接（用于用户管理）
 	ocrProcessor   *ocr.OCRProcessor    // OCR处理器（纯Go实现，用于处理扫描件PDF）
 
 	// 异步检查相关
@@ -126,6 +132,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 
 	// 初始化 MySQL（可选）
 	var db *sql.DB
+	var gormDB *gorm.DB
 	if cfg.MySQLDSN != "" {
 		var err error
 		db, err = sql.Open("mysql", cfg.MySQLDSN)
@@ -136,9 +143,26 @@ func NewServer(cfg *config.Config) (*Server, error) {
 			return nil, fmt.Errorf("MySQL 连接测试失败: %v", err)
 		}
 
+		// 初始化 GORM
+		gormDB, err = gorm.Open(mysql.Open(cfg.MySQLDSN), &gorm.Config{})
+		if err != nil {
+			return nil, fmt.Errorf("初始化 GORM 失败: %v", err)
+		}
+		logger.Info("GORM 已连接，数据库: %s", cfg.MySQLDSN)
+
+		// 测试查询users表是否存在
+		var testUser models.User
+		testResult := gormDB.First(&testUser)
+		if testResult.Error != nil && testResult.Error != gorm.ErrRecordNotFound {
+			logger.Warn("警告: 无法查询users表，可能表不存在: %v", testResult.Error)
+		} else {
+			logger.Info("users表连接正常")
+		}
+
 		// 创建意见反馈表（如果不存在）
 		createTableSQL := `CREATE TABLE IF NOT EXISTS feedbacks (
 	id BIGINT AUTO_INCREMENT PRIMARY KEY,
+	user_id INT UNSIGNED DEFAULT 0,
 	name VARCHAR(100) NOT NULL,
 	title VARCHAR(255) NOT NULL,
 	description TEXT NOT NULL,
@@ -147,6 +171,12 @@ func NewServer(cfg *config.Config) (*Server, error) {
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`
 		if _, err := db.Exec(createTableSQL); err != nil {
 			return nil, fmt.Errorf("创建反馈表失败: %v", err)
+		}
+		// 兼容已有表：如果 user_id 列不存在则添加
+		alterSQL := `ALTER TABLE feedbacks ADD COLUMN user_id INT UNSIGNED DEFAULT 0 AFTER id`
+		if _, err := db.Exec(alterSQL); err != nil {
+			// 列已存在时忽略错误
+			logger.Info("feedbacks 表 user_id 列已存在或添加失败（可忽略）: %v", err)
 		}
 		logger.Info("MySQL 已连接，反馈表初始化成功")
 	} else {
@@ -193,6 +223,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		failedFilesDir: failedFilesDir,
 		files:          make(map[string]*FileInfo),
 		db:             db,
+		gormDB:         gormDB,
 		ocrProcessor:   ocrProcessor,
 		checkQueue:     make(chan *checkTaskWithResult, 100), // 检查任务队列，缓冲区100
 		checkWorkers:   3,                                    // 3个工作协程处理检查任务
@@ -248,6 +279,8 @@ func (s *Server) Start(port string) error {
 
 	// API路由
 	mux.HandleFunc("/api/health", s.handleHealth)
+	mux.HandleFunc("/api/login", s.handleLogin)
+	mux.HandleFunc("/api/test-password", s.handleTestPassword) // 测试密码验证接口（仅用于调试）
 	mux.HandleFunc("/api/upload", s.handleUpload)
 	mux.HandleFunc("/api/upload-batch", s.handleBatchUpload)
 	mux.HandleFunc("/api/query", s.handleQuery)
@@ -265,6 +298,14 @@ func (s *Server) Start(port string) error {
 		}
 	})
 
+	// 静态文件服务：上传的反馈图片
+	uploadsDir := "./uploads"
+	if _, err := os.Stat(uploadsDir); err == nil {
+		uploadsFS := http.FileServer(http.Dir(uploadsDir))
+		mux.Handle("/uploads/", http.StripPrefix("/uploads/", uploadsFS))
+		logger.Info("已启用上传文件静态服务: /uploads/")
+	}
+
 	// 静态文件服务（Vue前端，相对于backend目录，需要回到项目根目录）
 	staticDir := "./frontend/dist"
 	if _, err := os.Stat(staticDir); err == nil {
@@ -273,6 +314,11 @@ func (s *Server) Start(port string) error {
 	} else {
 		// 如果前端目录不存在，提供一个简单的提示
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			// 如果请求的是 /uploads/ 路径，已经在上面的路由处理了，这里不需要处理
+			if strings.HasPrefix(r.URL.Path, "/uploads/") {
+				http.NotFound(w, r)
+				return
+			}
 			if r.URL.Path != "/" {
 				http.NotFound(w, r)
 				return
@@ -321,7 +367,227 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleCheckAdmin 检查管理员权限
+// handleLogin 处理用户登录
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	// 检查数据库连接
+	if s.gormDB == nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"message": "数据库未配置",
+		})
+		return
+	}
+
+	// 从数据库查询用户
+	var user models.User
+	logger.Info("尝试登录，用户名: %s, 输入密码长度: %d", req.Username, len(req.Password))
+	result := s.gormDB.Where("username = ?", req.Username).First(&user)
+	if result.Error != nil {
+		if result.Error == gorm.ErrRecordNotFound {
+			logger.Info("用户不存在: %s", req.Username)
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "用户名或密码错误",
+			})
+		} else {
+			logger.Error("查询用户失败: %v", result.Error)
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "登录失败，请稍后重试",
+			})
+		}
+		return
+	}
+
+	logger.Info("找到用户: %s (ID: %d), 创建时间: %v", user.Username, user.ID, user.CreatedAt)
+
+	// 清理密码hash（去除前后空格和换行符）
+	passwordHash := strings.TrimSpace(user.Password)
+	passwordHash = strings.Trim(passwordHash, "\n\r")
+
+	// 清理用户输入的密码（去除前后空格，但保留中间空格）
+	inputPassword := strings.TrimSpace(req.Password)
+
+	// 调试：检查密码hash格式（只显示前20个字符，避免泄露完整hash）
+	if len(passwordHash) > 20 {
+		logger.Info("密码hash前缀: %s... (长度: %d)", passwordHash[:20], len(passwordHash))
+	} else {
+		logger.Info("密码hash: %s (长度: %d)", passwordHash, len(passwordHash))
+	}
+	logger.Info("输入密码长度: %d, 原始长度: %d", len(inputPassword), len(req.Password))
+
+	// 检查输入密码是否为空
+	if len(inputPassword) == 0 {
+		logger.Info("输入密码为空")
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"message": "密码不能为空",
+		})
+		return
+	}
+
+	// 检查密码hash格式是否正确（bcrypt hash应该以$2a$、$2b$、$2y$等开头）
+	if !strings.HasPrefix(passwordHash, "$2a$") && !strings.HasPrefix(passwordHash, "$2b$") &&
+		!strings.HasPrefix(passwordHash, "$2y$") && !strings.HasPrefix(passwordHash, "$2x$") {
+		hashPreview := passwordHash
+		if len(hashPreview) > 30 {
+			hashPreview = hashPreview[:30] + "..."
+		}
+		logger.Error("密码hash格式不正确，不是有效的bcrypt hash: %s", hashPreview)
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"message": "用户密码格式错误，请联系管理员",
+		})
+		return
+	}
+
+	// 验证密码（使用bcrypt验证加密密码）
+	// admin-system项目使用bcrypt加密密码，这里需要使用bcrypt.CompareHashAndPassword验证
+	// 注意：第一个参数是数据库中存储的hash，第二个参数是用户输入的明文密码
+	// bcrypt.CompareHashAndPassword会：
+	// 1. 从hash中提取salt和cost参数
+	// 2. 使用相同的salt和cost对输入的明文密码进行哈希
+	// 3. 比较生成的hash和存储的hash是否一致
+	err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(inputPassword))
+	if err != nil {
+		logger.Info("密码验证失败，用户: %s, 错误: %v", req.Username, err)
+		// 提供更友好的错误提示
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"message": "用户名或密码错误，请确认密码是否正确",
+		})
+		return
+	}
+
+	// 判断是否是admin账号（username为"admin"的视为管理员）
+	isAdmin := strings.ToLower(user.Username) == "admin"
+
+	// 生成token（简单实现，实际应该使用JWT）
+	var userToken string
+	if isAdmin {
+		userToken = s.adminToken
+	} else {
+		// 普通用户token格式：user_token_{base64编码的用户名}
+		// 使用base64编码避免中文字符导致HTTP header错误
+		encodedUsername := base64.URLEncoding.EncodeToString([]byte(user.Username))
+		userToken = fmt.Sprintf("user_token_%s", encodedUsername)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success":  true,
+		"token":    userToken,
+		"isAdmin":  isAdmin,
+		"username": user.Username,
+		"userId":   user.ID,
+		"message":  "登录成功",
+	})
+}
+
+// handleTestPassword 测试密码验证接口（仅用于调试，生产环境应删除）
+func (s *Server) handleTestPassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+
+	// 检查数据库连接
+	if s.gormDB == nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"message": "数据库未配置",
+		})
+		return
+	}
+
+	// 从数据库查询用户
+	var user models.User
+	result := s.gormDB.Where("username = ?", req.Username).First(&user)
+	if result.Error != nil {
+		if result.Error == gorm.ErrRecordNotFound {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": "用户不存在",
+			})
+		} else {
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("查询用户失败: %v", result.Error),
+			})
+		}
+		return
+	}
+
+	// 清理密码hash
+	passwordHash := strings.TrimSpace(user.Password)
+	passwordHash = strings.Trim(passwordHash, "\n\r")
+	inputPassword := strings.TrimSpace(req.Password)
+
+	// 测试密码验证
+	err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(inputPassword))
+
+	w.Header().Set("Content-Type", "application/json")
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":     false,
+			"message":     "密码验证失败",
+			"error":       err.Error(),
+			"hashPrefix":  passwordHash[:min(20, len(passwordHash))],
+			"hashLength":  len(passwordHash),
+			"inputLength": len(inputPassword),
+		})
+	} else {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":     true,
+			"message":     "密码验证成功",
+			"hashPrefix":  passwordHash[:min(20, len(passwordHash))],
+			"hashLength":  len(passwordHash),
+			"inputLength": len(inputPassword),
+		})
+	}
+}
+
+// min 辅助函数（Go 1.21+有内置，这里为了兼容性添加）
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// handleCheckAdmin 检查用户权限（支持管理员和普通用户）
 func (s *Server) handleCheckAdmin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -338,15 +604,60 @@ func (s *Server) handleCheckAdmin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+
+	// 检查是否是管理员token
 	if req.Token == s.adminToken {
+		// 查找admin用户的ID
+		var adminUserID uint
+		if s.gormDB != nil {
+			var adminUser models.User
+			if result := s.gormDB.Where("username = ?", "admin").First(&adminUser); result.Error == nil {
+				adminUserID = adminUser.ID
+			}
+		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"isAdmin": true,
+			"isAdmin":    true,
+			"isLoggedIn": true,
+			"username":   "admin",
+			"userId":     adminUserID,
 		})
-	} else {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"isAdmin": false,
-		})
+		return
 	}
+
+	// 检查是否是普通用户token
+	if strings.HasPrefix(req.Token, "user_token_") {
+		encodedUsername := strings.TrimPrefix(req.Token, "user_token_")
+		// 解码base64编码的用户名
+		decodedBytes, err := base64.URLEncoding.DecodeString(encodedUsername)
+		var username string
+		if err != nil {
+			// 如果解码失败，可能是旧格式的token，直接使用
+			username = encodedUsername
+		} else {
+			username = string(decodedBytes)
+		}
+		// 查找用户ID
+		var userID uint
+		if s.gormDB != nil {
+			var user models.User
+			if result := s.gormDB.Where("username = ?", username).First(&user); result.Error == nil {
+				userID = user.ID
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"isAdmin":    false,
+			"isLoggedIn": true,
+			"username":   username,
+			"userId":     userID,
+		})
+		return
+	}
+
+	// 未登录
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"isAdmin":    false,
+		"isLoggedIn": false,
+	})
 }
 
 // handleUpload 处理单个文件上传
@@ -894,6 +1205,16 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 检查用户是否登录
+	if !s.checkUserAuth(r) {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":   "Unauthorized",
+			"message": "请先登录才能使用AI搜索功能",
+		})
+		return
+	}
+
 	var req struct {
 		Question string `json:"question"`
 		TopK     int    `json:"topk"`
@@ -919,7 +1240,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.TopK == 0 {
-		req.TopK = 3
+		req.TopK = 2
 	}
 
 	// 创建临时RAG实例用于查询（使用指定的topK）
@@ -1979,6 +2300,47 @@ func (s *Server) handleFileDelete(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// getUserIDFromToken 从请求的 token 中解析出用户 ID
+func (s *Server) getUserIDFromToken(r *http.Request) uint {
+	if s.gormDB == nil {
+		return 0
+	}
+
+	// 从 Authorization header 获取 token
+	token := r.Header.Get("Authorization")
+	if token == "" {
+		return 0
+	}
+	token = strings.TrimPrefix(token, "Bearer ")
+
+	// 管理员 token
+	if token == s.adminToken {
+		var user models.User
+		if result := s.gormDB.Where("username = ?", "admin").First(&user); result.Error == nil {
+			return user.ID
+		}
+		return 0
+	}
+
+	// 普通用户 token：user_token_{base64(username)}
+	if strings.HasPrefix(token, "user_token_") {
+		encodedUsername := strings.TrimPrefix(token, "user_token_")
+		decodedBytes, err := base64.URLEncoding.DecodeString(encodedUsername)
+		var username string
+		if err != nil {
+			username = encodedUsername
+		} else {
+			username = string(decodedBytes)
+		}
+		var user models.User
+		if result := s.gormDB.Where("username = ?", username).First(&user); result.Error == nil {
+			return user.ID
+		}
+	}
+
+	return 0
+}
+
 // handleFeedback 处理意见反馈提交，将数据写入 MySQL
 func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
@@ -1992,6 +2354,9 @@ func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 从 token 获取当前登录用户 ID
+	userID := s.getUserIDFromToken(r)
+
 	// 解析表单（包括可选图片）
 	if err := r.ParseMultipartForm(10 << 20); err != nil { // 10MB
 		http.Error(w, fmt.Sprintf("解析表单失败: %v", err), http.StatusBadRequest)
@@ -2002,9 +2367,20 @@ func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request) {
 	title := strings.TrimSpace(r.FormValue("title"))
 	description := strings.TrimSpace(r.FormValue("description"))
 
-	if name == "" || title == "" || description == "" {
-		http.Error(w, "姓名、标题、详细描述为必填项", http.StatusBadRequest)
+	if title == "" || description == "" {
+		http.Error(w, "标题、详细描述为必填项", http.StatusBadRequest)
 		return
+	}
+
+	// 如果 name 为空，自动用当前登录用户的用户名填充
+	if name == "" && userID > 0 && s.gormDB != nil {
+		var user models.User
+		if result := s.gormDB.First(&user, userID); result.Error == nil {
+			name = user.Username
+		}
+	}
+	if name == "" {
+		name = "匿名用户"
 	}
 
 	// 图片（可选）：保存到本地目录，并在数据库中记录相对路径
@@ -2045,14 +2421,16 @@ func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 写入 MySQL
-	query := `INSERT INTO feedbacks (name, title, description, image, created_at) VALUES (?, ?, ?, ?, ?)`
-	_, err = s.db.Exec(query, name, title, description, imagePath, time.Now())
+	// 写入 MySQL（包含 user_id）
+	query := `INSERT INTO feedbacks (user_id, name, title, description, image, created_at) VALUES (?, ?, ?, ?, ?, ?)`
+	_, err = s.db.Exec(query, userID, name, title, description, imagePath, time.Now())
 	if err != nil {
 		logger.Error("保存反馈失败: %v", err)
 		http.Error(w, fmt.Sprintf("保存反馈失败: %v", err), http.StatusInternalServerError)
 		return
 	}
+
+	logger.Info("反馈已保存，用户ID: %d, 姓名: %s", userID, name)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -2141,6 +2519,40 @@ func (s *Server) checkAdminAuth(r *http.Request) bool {
 	// 从Query参数获取token
 	token = r.URL.Query().Get("token")
 	return token == s.adminToken
+}
+
+// checkUserAuth 检查用户是否登录（管理员或普通用户）
+func (s *Server) checkUserAuth(r *http.Request) bool {
+	// 从Header获取token
+	token := r.Header.Get("Authorization")
+	if token != "" {
+		// 支持 "Bearer token" 格式
+		token = strings.TrimPrefix(token, "Bearer ")
+		// 检查是否是管理员token
+		if token == s.adminToken {
+			return true
+		}
+		// 检查是否是普通用户token（支持base64编码的用户名）
+		if strings.HasPrefix(token, "user_token_") {
+			return true
+		}
+		return false
+	}
+
+	// 从Query参数获取token
+	token = r.URL.Query().Get("token")
+	if token == "" {
+		return false
+	}
+	// 检查是否是管理员token
+	if token == s.adminToken {
+		return true
+	}
+	// 检查是否是普通用户token（支持base64编码的用户名）
+	if strings.HasPrefix(token, "user_token_") {
+		return true
+	}
+	return false
 }
 
 // getStackTrace 获取当前goroutine的堆栈跟踪信息

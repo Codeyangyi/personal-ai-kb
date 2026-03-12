@@ -11,7 +11,7 @@
         <button class="help-btn" @click="showHelp = true" title="查看帮助文档">
           <span class="help-text">帮助文档</span>
         </button>
-        <button class="feedback-btn-top" @click="showFeedback = true" title="意见反馈">
+        <button class="feedback-btn-top" @click="handleOpenFeedback" title="意见反馈">
           <span class="feedback-text">意见反馈</span>
         </button>
       </div>
@@ -228,17 +228,6 @@
         <div class="feedback-modal-content">
           <form @submit.prevent="handleFeedbackSubmit" class="feedback-form">
             <div class="form-group">
-              <label for="feedback-name">反馈人姓名 <span class="required">*</span></label>
-              <input
-                id="feedback-name"
-                v-model="feedbackForm.name"
-                type="text"
-                placeholder="请输入您的姓名"
-                required
-              />
-            </div>
-
-            <div class="form-group">
               <label for="feedback-title">标题 <span class="required">*</span></label>
               <input
                 id="feedback-title"
@@ -305,7 +294,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, inject } from 'vue'
 import axios from 'axios'
 
  const API_BASE = '/api'
@@ -323,9 +312,21 @@ const fileCount = ref(0)
 const showMessage = ref(false)
 const messageText = ref('')
 
-// 反馈表单数据
+// 获取登录状态
+const isLoggedIn = inject('isLoggedIn', ref(false))
+
+// 打开反馈弹窗前检查登录状态
+function handleOpenFeedback() {
+  if (!isLoggedIn.value) {
+    showMessageDialog('请先登录后再提交意见反馈')
+    window.dispatchEvent(new CustomEvent('show-login'))
+    return
+  }
+  showFeedback.value = true
+}
+
+// 反馈表单数据（反馈人通过登录 user_id 自动关联，无需手动填写姓名）
 const feedbackForm = ref({
-  name: '',
   title: '',
   description: '',
   image: null,
@@ -378,6 +379,14 @@ onMounted(() => {
 async function handleSearch() {
   if (!query.value.trim()) return
 
+  // 检查用户是否登录
+  if (!isLoggedIn.value) {
+    showMessageDialog('请先登录才能使用AI搜索功能')
+    // 通过事件通知父组件显示登录弹窗
+    window.dispatchEvent(new CustomEvent('show-login'))
+    return
+  }
+
   searching.value = true
   searchAnswer.value = ''
   searchResults.value = []
@@ -385,9 +394,19 @@ async function handleSearch() {
   searchError.value = ''
 
   try {
+    // 获取用户token
+    const token = localStorage.getItem('userToken')
+    const headers = {}
+    if (token && token.trim()) {
+      // 确保token是有效的字符串，避免包含特殊字符导致header设置失败
+      headers['Authorization'] = `Bearer ${token.trim()}`
+    }
+
     const response = await axios.post(`${API_BASE}/query`, {
       question: query.value.trim(),
-      topk: 3
+      topk: 2
+    }, {
+      headers: headers
     })
 
     if (response.data.answer) {
@@ -403,9 +422,22 @@ async function handleSearch() {
     }
   } catch (error) {
     console.error('搜索失败:', error)
+    // 处理未授权错误
+    if (error.response?.status === 401) {
+      searchError.value = '请先登录才能使用AI搜索功能'
+      showMessageDialog('请先登录才能使用AI搜索功能')
+      // 通过事件通知父组件显示登录弹窗
+      window.dispatchEvent(new CustomEvent('show-login'))
+      // 更新登录状态
+      if (isLoggedIn.value) {
+        isLoggedIn.value = false
+        localStorage.removeItem('userToken')
+      }
+    } else {
     // 优先显示后端返回的详细错误信息（message字段），如果没有则显示error字段，最后才显示通用错误
     const errorData = error.response?.data
     searchError.value = errorData?.message || errorData?.error || error.message || '搜索失败，请稍后重试'
+    }
   } finally {
     searching.value = false
   }
@@ -508,7 +540,6 @@ function closeFeedback() {
   // 延迟重置表单，让关闭动画完成
   setTimeout(() => {
     feedbackForm.value = {
-      name: '',
       title: '',
       description: '',
       image: null,
@@ -586,8 +617,8 @@ function closeMessage() {
 
 // 提交反馈
 async function handleFeedbackSubmit() {
-  if (!feedbackForm.value.name.trim() || !feedbackForm.value.title.trim() || !feedbackForm.value.description.trim()) {
-    alert('请填写完整的反馈信息（姓名、标题、详细描述为必填项）')
+  if (!feedbackForm.value.title.trim() || !feedbackForm.value.description.trim()) {
+    alert('请填写完整的反馈信息（标题、详细描述为必填项）')
     return
   }
 
@@ -596,26 +627,30 @@ async function handleFeedbackSubmit() {
   try {
     // 创建FormData以支持文件上传
     const formData = new FormData()
-    formData.append('name', feedbackForm.value.name)
+    // name 由后端根据 token 自动填充当前登录用户名
+    formData.append('name', '')
     formData.append('title', feedbackForm.value.title)
     formData.append('description', feedbackForm.value.description)
     if (feedbackForm.value.image) {
       formData.append('image', feedbackForm.value.image)
     }
 
-    // 提交到后端API
-    // 注意：这里需要后端提供反馈接口，如果还没有，可以先使用console.log
-    try {
-      await axios.post(`${API_BASE}/feedback`, formData, {
-        headers: {
+    // 提交到后端API（带上 token 以便后端识别当前登录用户）
+    const userToken = localStorage.getItem('userToken')
+    const requestHeaders = {
           'Content-Type': 'multipart/form-data'
         }
+    if (userToken) {
+      requestHeaders['Authorization'] = `Bearer ${userToken}`
+    }
+
+    try {
+      await axios.post(`${API_BASE}/feedback`, formData, {
+        headers: requestHeaders
       })
       alert('感谢您的反馈！我们会认真对待每一条建议。')
     } catch (apiError) {
-      // 如果后端接口不存在，先使用前端提示
       console.log('反馈内容:', {
-        name: feedbackForm.value.name,
         title: feedbackForm.value.title,
         description: feedbackForm.value.description,
         image: feedbackForm.value.image ? feedbackForm.value.image.name : null

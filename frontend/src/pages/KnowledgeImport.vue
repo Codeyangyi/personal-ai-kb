@@ -194,7 +194,7 @@
 import { ref, onMounted, computed } from 'vue'
 import axios from 'axios'
 
-   const API_BASE = '/api'
+  const API_BASE = '/api'
  //const API_BASE = '/rest/api'
 const fileInput = ref(null)
 const selectedFiles = ref([])
@@ -253,7 +253,7 @@ onMounted(() => {
 
 async function fetchFiles() {
   try {
-    const token = localStorage.getItem('adminToken')
+    const token = localStorage.getItem('userToken')
     if (!token) {
       console.warn('未登录，无法获取文件列表')
       return
@@ -297,7 +297,7 @@ async function handleUpload() {
   uploadProgress.value = 0
   uploadResults.value = []
 
-  const token = localStorage.getItem('adminToken')
+  const token = localStorage.getItem('userToken')
   const formData = new FormData()
   
   selectedFiles.value.forEach(file => {
@@ -378,7 +378,7 @@ function formatFileSize(bytes) {
 }
 
 function downloadFile(fileId, filename) {
-  const token = localStorage.getItem('adminToken')
+  const token = localStorage.getItem('userToken')
   const url = `${API_BASE}/files/${fileId}?token=${token}`
   const link = document.createElement('a')
   link.href = url
@@ -394,7 +394,7 @@ async function deleteFile(fileId, filename) {
   }
 
   try {
-    const token = localStorage.getItem('adminToken')
+    const token = localStorage.getItem('userToken')
     const response = await axios.delete(`${API_BASE}/files/${fileId}`, {
       headers: {
         'Authorization': `Bearer ${token}`
