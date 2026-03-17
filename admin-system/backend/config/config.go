@@ -20,17 +20,17 @@ type Config struct {
 // LoadConfig 从环境变量加载配置
 func LoadConfig() *Config {
 	return &Config{
-		//MySQLDSN: getEnv("MYSQL_DSN", "personal-ai-kb:6mcETznRjwdmK7XN@tcp(127.0.0.1:3306)/ai_kb?charset=utf8mb4&parseTime=true&loc=Local"),
-		MySQLHost: getEnv("MYSQL_HOST", "127.0.0.1"),
-		MySQLPort: getEnv("MYSQL_PORT", "3306"),
-		// MySQLUser:     getEnv("MYSQL_USER", "root"),
-		// MySQLPassword: getEnv("MYSQL_PASSWORD", "123456"),
-		// MySQLDatabase: getEnv("MYSQL_DATABASE", "ai_kb"),
-		// ServerPort:    getEnv("SERVER_PORT", "8007"),
-		MySQLUser:     getEnv("MYSQL_USER", "personal-ai-kb"),
-		MySQLPassword: getEnv("MYSQL_PASSWORD", "6mcETznRjwdmK7XN"),
+		MySQLHost:     getEnv("MYSQL_HOST", "127.0.0.1"),
+		MySQLPort:     getEnv("MYSQL_PORT", "3306"),
+		MySQLUser:     getEnv("MYSQL_USER", "root"),
+		MySQLPassword: getEnv("MYSQL_PASSWORD", "123456"),
 		MySQLDatabase: getEnv("MYSQL_DATABASE", "ai_kb"),
 		ServerPort:    getEnv("SERVER_PORT", "8007"),
+		// MySQLUser:     getEnv("MYSQL_USER", "personal-ai-kb"),
+		// MySQLPassword: getEnv("MYSQL_PASSWORD", "6mcETznRjwdmK7XN"),
+		// MySQLDatabase: getEnv("MYSQL_DATABASE", "ai_kb"),
+		// ServerPort:    getEnv("SERVER_PORT", "8007"),
+
 	}
 }
 
