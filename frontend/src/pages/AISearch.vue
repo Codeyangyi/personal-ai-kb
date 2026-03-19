@@ -297,7 +297,7 @@
 import { ref, computed, onMounted, inject } from 'vue'
 import axios from 'axios'
 
- const API_BASE = '/api'
+const API_BASE = '/api'
 //const API_BASE = '/rest/api'
 const query = ref('')
 const searching = ref(false)
@@ -404,7 +404,7 @@ async function handleSearch() {
 
     const response = await axios.post(`${API_BASE}/query`, {
       question: query.value.trim(),
-      topk: 2
+      topk: 8
     }, {
       headers: headers
     })

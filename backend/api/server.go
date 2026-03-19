@@ -1237,7 +1237,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.TopK == 0 {
-		req.TopK = 2
+		req.TopK = 8
 	}
 
 	// 创建临时RAG实例用于查询（使用指定的topK）
@@ -1277,8 +1277,27 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	logger.Info("查询成功，答案长度: %d 字符, 结果数量: %d", len(queryResult.Answer), len(queryResult.Results))
 
+	// debug模式：/api/query?debug=1 返回命中的文件信息，便于判断“检索问题”还是“模型问题”
+	debugEnabled := r.URL.Query().Get("debug") == "1"
+
 	// 分析答案中的标注，找出被使用的文档片段编号
 	usedIndices := extractUsedAnnotations(queryResult.Answer)
+
+	// 关键修复：当LLM返回“找不到相关信息”时，通常不会输出①②标注，导致usedIndices为空，
+	// 进而 docGroupsMap数量=0、results数量=0，前端看不到任何检索上下文。
+	// 为了让用户仍能看到“实际检索到了哪些片段/来自哪些文件”，这里在无标注时回退为：返回前N个片段。
+	if len(usedIndices) == 0 {
+		fallbackN := req.TopK
+		if fallbackN <= 0 {
+			fallbackN = 3
+		}
+		if fallbackN > len(queryResult.Results) {
+			fallbackN = len(queryResult.Results)
+		}
+		for i := 0; i < fallbackN; i++ {
+			usedIndices[i+1] = true // 标注索引从1开始
+		}
+	}
 
 	// 按文档来源分组，只返回被标注使用的文档片段
 	// 使用 map 来按文档来源分组
@@ -1659,6 +1678,30 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			"answer":    queryResult.Answer,
 			"results":   searchResults,    // 平铺格式（兼容旧前端）
 			"docGroups": limitedDocGroups, // 按文档分组的格式（新格式）
+		}
+
+		if debugEnabled {
+			// 输出返回的docGroups文件名列表（标题）
+			docTitles := make([]string, 0, len(limitedDocGroups))
+			for _, g := range limitedDocGroups {
+				if g.DocTitle != "" {
+					docTitles = append(docTitles, g.DocTitle)
+				}
+			}
+			// 输出本次检索到的原始候选片段来源（不依赖LLM是否引用标注）
+			retrievedSources := make([]string, 0, len(queryResult.Results))
+			for _, d := range queryResult.Results {
+				if s, ok := d.Metadata["source"].(string); ok && s != "" {
+					retrievedSources = append(retrievedSources, extractOriginalFilename(filepath.Base(s)))
+				}
+			}
+			response["debug"] = map[string]interface{}{
+				"requestedTopK":     req.TopK,
+				"returnedDocGroups": len(limitedDocGroups),
+				"returnedChunks":    len(searchResults),
+				"docTitles":         docTitles,
+				"retrievedSources":  retrievedSources,
+			}
 		}
 	}()
 	logger.Info("响应数据构建完成，准备编码JSON，answer长度: %d, results数量: %d, docGroups数量: %d", len(queryResult.Answer), len(searchResults), len(limitedDocGroups))

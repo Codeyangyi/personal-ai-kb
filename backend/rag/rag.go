@@ -3,6 +3,7 @@ package rag
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -46,13 +47,13 @@ func (r *RAG) Query(ctx context.Context, question string) (string, error) {
 	// - 在Qdrant向量数据库中进行相似性搜索
 	// - 返回最相关的topK个文本块
 
-	// 混合搜索策略：先搜索更多结果（topK*3），然后进行严格的相关性过滤
-	searchTopK := r.topK * 3
-	if searchTopK < 15 {
-		searchTopK = 15 // 至少搜索15个结果
+	// 混合搜索策略：先搜索更多结果（topK*5）扩大召回，减少“命不中正确文件”的概率
+	searchTopK := r.topK * 5
+	if searchTopK < 30 {
+		searchTopK = 30 // 至少搜索30个结果
 	}
-	if searchTopK > 50 {
-		searchTopK = 50 // 最多搜索50个结果
+	if searchTopK > 80 {
+		searchTopK = 80 // 最多搜索80个结果
 	}
 
 	logger.Info("正在向量化问题并搜索知识库...")
@@ -162,13 +163,13 @@ func (r *RAG) QueryWithResults(ctx context.Context, question string) (*QueryResu
 	// - 在Qdrant向量数据库中进行相似性搜索
 	// - 返回最相关的topK个文本块
 
-	// 混合搜索策略：先搜索更多结果（topK*3），然后进行严格的相关性过滤
-	searchTopK := r.topK * 3
-	if searchTopK < 15 {
-		searchTopK = 15 // 至少搜索15个结果
+	// 混合搜索策略：先搜索更多结果（topK*5）扩大召回，减少“命不中正确文件”的概率
+	searchTopK := r.topK * 5
+	if searchTopK < 30 {
+		searchTopK = 30 // 至少搜索30个结果
 	}
-	if searchTopK > 50 {
-		searchTopK = 50 // 最多搜索50个结果
+	if searchTopK > 80 {
+		searchTopK = 80 // 最多搜索80个结果
 	}
 
 	logger.Info("正在向量化问题并搜索知识库...")
@@ -343,6 +344,33 @@ func (r *RAG) buildPrompt(question string, results []schema.Document) string {
 	return builder.String()
 }
 
+// extractDocFilename 从文档元数据中提取原始文件名（去除UUID前缀和扩展名）
+func extractDocFilename(doc schema.Document) string {
+	filename := ""
+	if fn, ok := doc.Metadata["file_name"].(string); ok && fn != "" {
+		filename = fn
+	} else if source, ok := doc.Metadata["source"].(string); ok && source != "" {
+		filename = filepath.Base(source)
+	}
+	if filename == "" {
+		return ""
+	}
+
+	// 去除UUID前缀（格式：{UUID}_{原文件名}）
+	if idx := strings.Index(filename, "_"); idx > 0 {
+		prefix := filename[:idx]
+		if len(prefix) == 36 && strings.Count(prefix, "-") == 4 {
+			filename = filename[idx+1:]
+		}
+	}
+
+	ext := filepath.Ext(filename)
+	if ext != "" {
+		filename = strings.TrimSuffix(filename, ext)
+	}
+	return strings.ToLower(strings.TrimSpace(filename))
+}
+
 // reRankResults 对搜索结果进行重排序，优先选择包含查询关键词的片段
 func (r *RAG) reRankResults(question string, allResults []schema.Document, topK int) []schema.Document {
 	if len(allResults) <= topK {
@@ -400,6 +428,25 @@ func (r *RAG) reRankResults(question string, allResults []schema.Document, topK 
 	for i, doc := range allResults {
 		lowerContent := strings.ToLower(doc.PageContent)
 		score := 0
+
+		// 文件名匹配强加权：问题中的关键词若出现在文件名中，优先认为该文档更可能相关
+		docFilename := extractDocFilename(doc)
+		if docFilename != "" {
+			matchedInFilename := 0
+			for _, keyword := range keywords {
+				kw := strings.ReplaceAll(keyword, " ", "")
+				if len([]rune(kw)) < 2 {
+					continue
+				}
+				if strings.Contains(docFilename, kw) {
+					matchedInFilename++
+				}
+			}
+			if matchedInFilename > 0 {
+				// 每命中一个关键词给高分，确保“城镇开发边界”这类问题优先落到相关文件
+				score += 200 + matchedInFilename*120
+			}
+		}
 
 		// 优先匹配完整短语
 		if strings.Contains(lowerContent, fullPhrase) {
