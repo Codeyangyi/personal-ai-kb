@@ -110,7 +110,6 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("创建通义千问客户端失败: %v", err)
 		}
-		logger.Info("使用通义千问模型: %s", cfg.DashScopeModel)
 	} else if cfg.LLMProvider == "kimi" {
 		// 使用Kimi2
 		llmClient, err = llm.NewKimiLLM(cfg.MoonshotAPIKey, cfg.MoonshotModel)
@@ -148,7 +147,6 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		if err != nil {
 			return nil, fmt.Errorf("初始化 GORM 失败: %v", err)
 		}
-		logger.Info("GORM 已连接，数据库: %s", cfg.MySQLDSN)
 
 		// 测试查询users表是否存在
 		var testUser models.User
@@ -176,7 +174,6 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		alterSQL := `ALTER TABLE feedbacks ADD COLUMN user_id INT UNSIGNED DEFAULT 0 AFTER id`
 		if _, err := db.Exec(alterSQL); err != nil {
 			// 列已存在时忽略错误
-			logger.Info("feedbacks 表 user_id 列已存在或添加失败（可忽略）: %v", err)
 		}
 		logger.Info("MySQL 已连接，反馈表初始化成功")
 	} else {
