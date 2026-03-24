@@ -372,52 +372,54 @@ func extractDocFilename(doc schema.Document) string {
 }
 
 // reRankResults 对搜索结果进行重排序，优先选择包含查询关键词的片段
+// 核心优化：提升完整短语权重，降低碎片词权重，解决多文件时搜索不准的问题
 func (r *RAG) reRankResults(question string, allResults []schema.Document, topK int) []schema.Document {
 	if len(allResults) <= topK {
 		return allResults
 	}
 
-	// 提取查询关键词（去除常见停用词）
 	lowerQuestion := strings.ToLower(question)
-	// 先尝试匹配完整短语
-	fullPhrase := lowerQuestion
 
-	// 提取关键词（去除"的"、"有"、"几"、"条"等常见词）
-	stopWords := map[string]bool{
-		"的": true, "有": true, "几": true, "条": true, "是": true,
-		"在": true, "和": true, "或": true, "与": true,
+	// 1. 剥离疑问词，提取核心实体短语
+	queryStopPhrases := []string{
+		"什么叫", "什么是", "请问", "怎么", "如何", "哪些", "怎样", "为什么",
+		"什么", "叫做", "是指", "指的是", "定义", "含义",
 	}
-	keywords := []string{}
+	corePhrase := lowerQuestion
+	for _, sw := range queryStopPhrases {
+		corePhrase = strings.ReplaceAll(corePhrase, sw, "")
+	}
+	for _, p := range []string{"？", "?", "。", ".", "，", ",", "！", "!"} {
+		corePhrase = strings.ReplaceAll(corePhrase, p, "")
+	}
+	corePhrase = strings.TrimSpace(corePhrase)
 
-	// 对于中文，需要按字符处理
-	// 先尝试提取2-4字的短语（如"培训要求"）
-	runes := []rune(lowerQuestion)
-	for i := 0; i < len(runes)-1; i++ {
-		for length := 2; length <= 4 && i+length <= len(runes); length++ {
-			phrase := string(runes[i : i+length])
-			// 检查是否包含停用词
+	// 2. 提取碎片关键词（仅4字以上，降低通用词干扰）
+	charStopWords := map[string]bool{
+		"的": true, "有": true, "几": true, "条": true, "是": true,
+		"在": true, "和": true, "或": true, "与": true, "叫": true,
+		"什": true, "么": true, "请": true, "问": true,
+	}
+	fragmentKeywords := []string{}
+	coreRunes := []rune(corePhrase)
+	for i := 0; i < len(coreRunes); i++ {
+		for length := 4; length <= 6 && i+length <= len(coreRunes); length++ {
+			phrase := string(coreRunes[i : i+length])
 			hasStopWord := false
-			for _, r := range phrase {
-				if stopWords[string(r)] {
+			for _, ch := range phrase {
+				if charStopWords[string(ch)] {
 					hasStopWord = true
 					break
 				}
 			}
 			if !hasStopWord {
-				keywords = append(keywords, phrase)
+				fragmentKeywords = append(fragmentKeywords, phrase)
 			}
 		}
 	}
 
-	// 如果关键词为空，使用完整短语
-	if len(keywords) == 0 {
-		keywords = []string{fullPhrase}
-	}
+	logger.Debug("[调试] 核心短语: %q  碎片关键词: %v\n", corePhrase, fragmentKeywords)
 
-	// 调试：显示提取的关键词
-	logger.Debug("[调试] 提取的关键词: %v, 完整短语: %s\n", keywords, fullPhrase)
-
-	// 计算每个片段的关键词匹配分数
 	type scoredDoc struct {
 		doc   schema.Document
 		score int
@@ -427,78 +429,57 @@ func (r *RAG) reRankResults(question string, allResults []schema.Document, topK 
 	scoredDocs := make([]scoredDoc, len(allResults))
 	for i, doc := range allResults {
 		lowerContent := strings.ToLower(doc.PageContent)
+		contentNS := strings.ReplaceAll(lowerContent, " ", "")
 		score := 0
 
-		// 文件名匹配强加权：问题中的关键词若出现在文件名中，优先认为该文档更可能相关
+		// 第1层：核心短语完整命中（最高权重）
+		corePhraseNS := strings.ReplaceAll(corePhrase, " ", "")
+		if corePhrase != "" {
+			if strings.Contains(lowerContent, corePhrase) || strings.Contains(contentNS, corePhraseNS) {
+				score += 2000
+			}
+		}
+
+		// 第2层：完整原始问题命中
+		fullNS := strings.ReplaceAll(lowerQuestion, " ", "")
+		if strings.Contains(lowerContent, lowerQuestion) || strings.Contains(contentNS, fullNS) {
+			score += 1000
+		}
+
+		// 第3层：文件名包含核心短语
 		docFilename := extractDocFilename(doc)
-		if docFilename != "" {
-			matchedInFilename := 0
-			for _, keyword := range keywords {
-				kw := strings.ReplaceAll(keyword, " ", "")
-				if len([]rune(kw)) < 2 {
-					continue
+		if docFilename != "" && corePhrase != "" {
+			if strings.Contains(docFilename, corePhrase) || strings.Contains(strings.ReplaceAll(docFilename, " ", ""), corePhraseNS) {
+				score += 800
+			} else {
+				matchedInFilename := 0
+				for _, kw := range fragmentKeywords {
+					if strings.Contains(docFilename, strings.ReplaceAll(kw, " ", "")) {
+						matchedInFilename++
+					}
 				}
-				if strings.Contains(docFilename, kw) {
-					matchedInFilename++
-				}
-			}
-			if matchedInFilename > 0 {
-				// 每命中一个关键词给高分，确保“城镇开发边界”这类问题优先落到相关文件
-				score += 200 + matchedInFilename*120
-			}
-		}
-
-		// 优先匹配完整短语
-		if strings.Contains(lowerContent, fullPhrase) {
-			score += 100 // 完整短语匹配给高分
-		}
-
-		// 尝试匹配去除停用词后的短语（如"培训要求"）
-		// 对于中文，需要按字符处理
-		phraseWithoutStopWords := ""
-		runes := []rune(lowerQuestion)
-		for _, r := range runes {
-			char := string(r)
-			if !stopWords[char] {
-				phraseWithoutStopWords += char
-			}
-		}
-		// 支持空格分隔的匹配
-		contentNoSpace := strings.ReplaceAll(lowerContent, " ", "")
-		if phraseWithoutStopWords != "" && (strings.Contains(lowerContent, phraseWithoutStopWords) || strings.Contains(contentNoSpace, phraseWithoutStopWords)) {
-			score += 80 // 去除停用词后的短语匹配给高分
-		}
-
-		// 计算关键词匹配分数
-		matchedKeywords := 0
-		for _, keyword := range keywords {
-			// 支持短语匹配（即使被空格分隔）
-			keywordPattern := strings.ReplaceAll(keyword, " ", "")
-			contentNoSpace := strings.ReplaceAll(lowerContent, " ", "")
-			if strings.Contains(contentNoSpace, keywordPattern) || strings.Contains(lowerContent, keyword) {
-				score += 20 // 每个匹配的关键词加20分
-				matchedKeywords++
-				// 如果关键词在标题或重要位置，额外加分
-				if strings.HasPrefix(lowerContent, keyword) || strings.Contains(lowerContent, keyword+" ") {
-					score += 10
+				if matchedInFilename > 0 {
+					score += 100 + matchedInFilename*50
 				}
 			}
 		}
 
-		// 如果匹配了所有关键词，额外加分
-		if matchedKeywords == len(keywords) && len(keywords) > 0 {
-			score += 50
+		// 第4层：碎片关键词命中（权重极低）
+		for _, keyword := range fragmentKeywords {
+			kwNS := strings.ReplaceAll(keyword, " ", "")
+			if strings.Contains(contentNS, kwNS) || strings.Contains(lowerContent, keyword) {
+				score += 5
+			}
 		}
 
-		// 保持原始顺序作为次要排序（索引越小，分数越高）
 		scoredDocs[i] = scoredDoc{
 			doc:   doc,
-			score: score - i, // 减去索引，保持原始顺序作为次要排序
+			score: score - i,
 			index: i,
 		}
 	}
 
-	// 按分数排序（分数高的在前）
+	// 按分数排序
 	for i := 0; i < len(scoredDocs)-1; i++ {
 		for j := i + 1; j < len(scoredDocs); j++ {
 			if scoredDocs[j].score > scoredDocs[i].score {
@@ -507,45 +488,24 @@ func (r *RAG) reRankResults(question string, allResults []schema.Document, topK 
 		}
 	}
 
-	// 调试：显示排序后的前几个片段（按分数从高到低）
 	if len(scoredDocs) > 0 {
 		logger.Debug("[调试] 重排序后（按分数从高到低，前5个）: ")
 		for i := 0; i < 5 && i < len(scoredDocs); i++ {
-			// 计算原始分数（加上索引）
 			originalScore := scoredDocs[i].score + scoredDocs[i].index
 			logger.Debug("片段%d(原始分数:%d,最终分数:%d) ", scoredDocs[i].index+1, originalScore, scoredDocs[i].score)
 		}
 	}
 
-	// 选择前topK个结果（排序后的前topK个），但只选择分数大于0的结果
-	// 分数为0表示完全不相关，应该被过滤掉
 	result := make([]schema.Document, 0, topK)
 	for i := 0; i < len(scoredDocs) && len(result) < topK; i++ {
-		// 计算原始分数（加上索引）
 		originalScore := scoredDocs[i].score + scoredDocs[i].index
-		// 只选择分数大于0的结果（至少匹配了一些关键词）
 		if originalScore > 0 {
 			result = append(result, scoredDocs[i].doc)
 		}
 	}
 
-	// 调试：显示选择的结果
-	if len(result) > 0 {
-		logger.Debug("[调试] 选择的结果（前%d个，已过滤不相关片段）: ", len(result))
-		for i := 0; i < len(result) && i < 3; i++ {
-			// 找到这个文档在原始结果中的索引
-			originalIndex := -1
-			for j, doc := range allResults {
-				if doc.PageContent == result[i].PageContent {
-					originalIndex = j
-					break
-				}
-			}
-			logger.Debug("结果%d(原始索引:%d) ", i+1, originalIndex+1)
-		}
-	} else {
+	if len(result) == 0 {
 		logger.Warn("[警告] 重排序后没有找到相关片段，将使用原始结果的前%d个\n", topK)
-		// 如果过滤后没有结果，至少返回前topK个（即使相关性不高）
 		for i := 0; i < topK && i < len(allResults); i++ {
 			result = append(result, allResults[i])
 		}
@@ -553,6 +513,7 @@ func (r *RAG) reRankResults(question string, allResults []schema.Document, topK 
 
 	return result
 }
+
 
 // filterRelevantResults 二次验证：过滤掉与问题不真正相关的文档片段
 // 通过检查文档内容是否真正包含问题的核心信息来判断相关性
