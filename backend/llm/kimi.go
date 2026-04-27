@@ -1,12 +1,14 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Codeyangyi/personal-ai-kb/logger"
@@ -171,4 +173,94 @@ func (k *KimiLLM) Generate(ctx context.Context, prompt string) (string, error) {
 	}
 
 	return answer, nil
+}
+
+// GenerateStream 流式生成回答（同时返回完整答案）
+func (k *KimiLLM) GenerateStream(ctx context.Context, prompt string, onChunk func(string) error) (string, error) {
+	reqBody := map[string]interface{}{
+		"model": k.model,
+		"messages": []map[string]interface{}{
+			{
+				"role":    "user",
+				"content": prompt,
+			},
+		},
+		"temperature": 0.7,
+		"max_tokens":  2000,
+		"top_p":       0.8,
+		"stream":      true,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal stream request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", k.baseURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create stream request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", k.apiKey))
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := k.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send stream request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("stream API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	type streamDelta struct {
+		Content string `json:"content"`
+	}
+	type streamChoice struct {
+		Delta streamDelta `json:"delta"`
+	}
+	type streamResp struct {
+		Choices []streamChoice `json:"choices"`
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var fullAnswer strings.Builder
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk streamResp
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+		text := chunk.Choices[0].Delta.Content
+		if text == "" {
+			continue
+		}
+
+		fullAnswer.WriteString(text)
+		if onChunk != nil {
+			if err := onChunk(text); err != nil {
+				return "", err
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("failed to read stream response: %w", err)
+	}
+
+	return fullAnswer.String(), nil
 }

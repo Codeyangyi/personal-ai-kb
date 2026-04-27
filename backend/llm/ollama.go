@@ -43,6 +43,35 @@ func (o *OllamaLLM) Generate(ctx context.Context, prompt string) (string, error)
 	return completion, nil
 }
 
+// GenerateStream 流式生成回答（同时返回完整答案）
+func (o *OllamaLLM) GenerateStream(ctx context.Context, prompt string, onChunk func(string) error) (string, error) {
+	var fullAnswer string
+	completion, err := o.llm.Call(ctx, prompt,
+		llms.WithMaxTokens(10000),
+		llms.WithTemperature(0.5),
+		llms.WithTopP(0.8),
+		llms.WithStopWords([]string{"问题:", "回答:"}),
+		llms.WithStreamingFunc(func(ctx context.Context, chunk []byte) error {
+			text := string(chunk)
+			if text == "" {
+				return nil
+			}
+			fullAnswer += text
+			if onChunk != nil {
+				return onChunk(text)
+			}
+			return nil
+		}),
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate streamed completion: %w", err)
+	}
+	if completion != "" && fullAnswer == "" {
+		fullAnswer = completion
+	}
+	return fullAnswer, nil
+}
+
 // GenerateWithOptions 使用选项生成回答
 func (o *OllamaLLM) GenerateWithOptions(ctx context.Context, prompt string, options ...llms.CallOption) (string, error) {
 	completion, err := o.llm.Call(ctx, prompt, options...)

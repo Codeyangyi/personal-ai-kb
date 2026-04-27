@@ -1,12 +1,14 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/Codeyangyi/personal-ai-kb/logger"
@@ -201,4 +203,107 @@ func (d *DashScopeLLM) Generate(ctx context.Context, prompt string) (string, err
 	}
 
 	return answer, nil
+}
+
+// GenerateStream 流式生成回答（同时返回完整答案）
+func (d *DashScopeLLM) GenerateStream(ctx context.Context, prompt string, onChunk func(string) error) (string, error) {
+	reqBody := map[string]interface{}{
+		"model": d.model,
+		"input": map[string]interface{}{
+			"messages": []map[string]interface{}{
+				{
+					"role":    "user",
+					"content": prompt,
+				},
+			},
+		},
+		"parameters": map[string]interface{}{
+			"max_tokens":  2000,
+			"temperature": 0.7,
+			"top_p":       0.8,
+			"incremental_output": true,
+		},
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal stream request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", d.baseURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create stream request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", d.apiKey))
+	req.Header.Set("X-DashScope-SSE", "enable")
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send stream request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("stream API request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	type streamMessage struct {
+		Content string `json:"content"`
+	}
+	type streamChoice struct {
+		Message streamMessage `json:"message"`
+	}
+	type streamOutput struct {
+		Choices []streamChoice `json:"choices"`
+		Text    string         `json:"text"`
+	}
+	type streamResp struct {
+		Output streamOutput `json:"output"`
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var fullAnswer strings.Builder
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			if data == "[DONE]" {
+				break
+			}
+			continue
+		}
+
+		var chunk streamResp
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+
+		text := chunk.Output.Text
+		if text == "" && len(chunk.Output.Choices) > 0 {
+			text = chunk.Output.Choices[0].Message.Content
+		}
+		if text == "" {
+			continue
+		}
+
+		fullAnswer.WriteString(text)
+		if onChunk != nil {
+			if err := onChunk(text); err != nil {
+				return "", err
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("failed to read stream response: %w", err)
+	}
+
+	return fullAnswer.String(), nil
 }

@@ -1191,8 +1191,16 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// 提前设置响应头，确保即使发生错误也能正确返回
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	streamEnabled := r.URL.Query().Get("stream") == "1"
+	if streamEnabled {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+	} else {
+		// 提前设置响应头，确保即使发生错误也能正确返回
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	}
 
 	if r.Method != "POST" {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -1240,6 +1248,20 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		req.TopK = 8
 	}
 
+	sendSSE := func(event string, data interface{}) error {
+		payload, err := json.Marshal(data)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, payload); err != nil {
+			return err
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		return nil
+	}
+
 	// 创建临时RAG实例用于查询（使用指定的topK）
 	tempRAG := rag.NewRAG(s.embedder, s.store, s.llm, req.TopK)
 
@@ -1261,17 +1283,31 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 				err = fmt.Errorf("查询处理时发生panic: %v", r)
 			}
 		}()
-		queryResult, err = tempRAG.QueryWithResults(ctx, req.Question)
+		if streamEnabled {
+			_ = sendSSE("start", map[string]interface{}{"message": "开始生成回答"})
+			queryResult, err = tempRAG.QueryWithResultsStream(ctx, req.Question, func(chunk string) error {
+				return sendSSE("chunk", map[string]interface{}{"text": chunk})
+			})
+		} else {
+			queryResult, err = tempRAG.QueryWithResults(ctx, req.Question)
+		}
 	}()
 	if err != nil {
 		logger.Error("查询失败 - 问题: %s, 错误: %v, 错误类型: %T, 客户端: %s", req.Question, err, err, r.RemoteAddr)
 		// 返回更详细的错误信息
-		w.WriteHeader(http.StatusInternalServerError)
-		if encodeErr := json.NewEncoder(w).Encode(map[string]interface{}{
-			"error":   "查询失败",
-			"message": err.Error(),
-		}); encodeErr != nil {
-			logger.Error("编码错误响应失败: %v", encodeErr)
+		if streamEnabled {
+			_ = sendSSE("error", map[string]interface{}{
+				"error":   "查询失败",
+				"message": err.Error(),
+			})
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+			if encodeErr := json.NewEncoder(w).Encode(map[string]interface{}{
+				"error":   "查询失败",
+				"message": err.Error(),
+			}); encodeErr != nil {
+				logger.Error("编码错误响应失败: %v", encodeErr)
+			}
 		}
 		return
 	}
@@ -1707,8 +1743,10 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	logger.Info("响应数据构建完成，准备编码JSON，answer长度: %d, results数量: %d, docGroups数量: %d", len(queryResult.Answer), len(searchResults), len(limitedDocGroups))
 
 	// 设置响应头，确保即使编码失败也能正确返回
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	if !streamEnabled {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	}
 
 	// 提前发送响应头，避免502错误（在Ubuntu/Nginx环境下很重要）
 	// 这样即使后续处理出现问题，客户端也能知道请求已收到
@@ -1759,6 +1797,15 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}()
+
+	if streamEnabled {
+		if err := sendSSE("result", response); err != nil {
+			logger.Error("发送流式结果失败: %v", err)
+			return
+		}
+		_ = sendSSE("done", map[string]interface{}{"ok": true})
+		return
+	}
 
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "") // 不格式化，减少响应大小

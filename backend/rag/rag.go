@@ -278,6 +278,73 @@ func (r *RAG) QueryWithResults(ctx context.Context, question string) (*QueryResu
 	}, nil
 }
 
+// QueryWithResultsStream 查询并流式生成回答，同时返回检索到的文档片段
+func (r *RAG) QueryWithResultsStream(ctx context.Context, question string, onChunk func(string) error) (*QueryResult, error) {
+	startTime := time.Now()
+
+	searchTopK := r.topK * 5
+	if searchTopK < 30 {
+		searchTopK = 30
+	}
+	if searchTopK > 80 {
+		searchTopK = 80
+	}
+
+	logger.Info("正在向量化问题并搜索知识库...")
+	embedStart := time.Now()
+	allResults, err := r.store.Search(ctx, question, r.embedder.GetEmbedder(), searchTopK)
+	embedDuration := time.Since(embedStart)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search: %w", err)
+	}
+	logger.Info(" ✅ (耗时: %v, 检索到 %d 个候选片段)\n", embedDuration.Round(time.Millisecond), len(allResults))
+
+	results := r.reRankResults(question, allResults, r.topK)
+	results = r.filterRelevantResults(question, results)
+	logger.Debug("[调试] 重排序后选择的前 %d 个片段（包含关键词的优先）\n", len(results))
+
+	if len(results) == 0 {
+		noAnswer := "抱歉，我在知识库中没有找到相关信息。"
+		if onChunk != nil {
+			if err := onChunk(noAnswer); err != nil {
+				return nil, err
+			}
+		}
+		return &QueryResult{
+			Answer:  noAnswer,
+			Results: []schema.Document{},
+		}, nil
+	}
+
+	prompt := r.buildPrompt(question, results)
+	logger.Info("正在生成回答（流式）...")
+	llmStart := time.Now()
+
+	llmCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
+	defer cancel()
+
+	answer, err := r.llm.GenerateStream(llmCtx, prompt, onChunk)
+	llmDuration := time.Since(llmStart)
+	if err != nil {
+		if llmCtx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("生成回答超时（超过120秒），请尝试：1) 减少检索文档数量 2) 检查网络连接 3) 检查API服务状态")
+		}
+		return nil, fmt.Errorf("failed to generate streamed answer: %w", err)
+	}
+	logger.Info(" ✅ (耗时: %v)\n", llmDuration.Round(time.Millisecond))
+
+	totalDuration := time.Since(startTime)
+	logger.Info("\n[性能] 总耗时: %v (向量检索: %v, LLM生成: %v)\n",
+		totalDuration.Round(time.Millisecond),
+		embedDuration.Round(time.Millisecond),
+		llmDuration.Round(time.Millisecond))
+
+	return &QueryResult{
+		Answer:  answer,
+		Results: results,
+	}, nil
+}
+
 // buildPrompt 构建增强提示
 // 将"原始问题" + "检索到的上下文"组合成一个增强的提示
 // 这个提示会被发送给LLM（Ollama），让LLM基于上下文信息生成精准、基于知识库的答案

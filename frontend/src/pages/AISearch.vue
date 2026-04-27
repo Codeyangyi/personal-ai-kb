@@ -396,29 +396,93 @@ async function handleSearch() {
   try {
     // 获取用户token
     const token = localStorage.getItem('userToken')
-    const headers = {}
+    const headers = {
+      'Content-Type': 'application/json'
+    }
     if (token && token.trim()) {
       // 确保token是有效的字符串，避免包含特殊字符导致header设置失败
       headers['Authorization'] = `Bearer ${token.trim()}`
     }
 
-    const response = await axios.post(`${API_BASE}/query`, {
-      question: query.value.trim(),
-      topk: 8
-    }, {
-      headers: headers
+    const response = await fetch(`${API_BASE}/query?stream=1`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        question: query.value.trim(),
+        topk: 8
+      })
     })
 
-    if (response.data.answer) {
-      searchAnswer.value = response.data.answer
+    if (!response.ok) {
+      let errorMessage = `请求失败: ${response.status}`
+      try {
+        const errJson = await response.json()
+        errorMessage = errJson?.message || errJson?.error || errorMessage
+      } catch (_) {}
+      throw new Error(errorMessage)
     }
-    
-    // 优先使用按文档分组的格式（新格式）
-    if (response.data.docGroups && response.data.docGroups.length > 0) {
-      docGroups.value = response.data.docGroups
-    } else if (response.data.results) {
-      // 兼容旧格式：如果没有docGroups，使用平铺格式
-      searchResults.value = response.data.results
+
+    if (!response.body) {
+      throw new Error('浏览器不支持流式响应')
+    }
+
+    const reader = response.body.getReader()
+    const decoder = new TextDecoder('utf-8')
+    let buffer = ''
+
+    const processEventBlock = (block) => {
+      const lines = block.split('\n')
+      let eventName = ''
+      let dataText = ''
+      for (const rawLine of lines) {
+        const line = rawLine.trim()
+        if (line.startsWith('event:')) {
+          eventName = line.slice(6).trim()
+        } else if (line.startsWith('data:')) {
+          dataText += line.slice(5).trim()
+        }
+      }
+
+      if (!eventName || !dataText) return
+
+      let payload = null
+      try {
+        payload = JSON.parse(dataText)
+      } catch (_) {
+        return
+      }
+
+      if (eventName === 'chunk' && payload?.text) {
+        searchAnswer.value += payload.text
+      } else if (eventName === 'result') {
+        if (!searchAnswer.value && payload?.answer) {
+          searchAnswer.value = payload.answer
+        }
+        if (payload?.docGroups && payload.docGroups.length > 0) {
+          docGroups.value = payload.docGroups
+        } else if (payload?.results) {
+          searchResults.value = payload.results
+        }
+      } else if (eventName === 'error') {
+        const message = payload?.message || payload?.error || '搜索失败，请稍后重试'
+        throw new Error(message)
+      }
+    }
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const blocks = buffer.split('\n\n')
+      buffer = blocks.pop() || ''
+      for (const block of blocks) {
+        processEventBlock(block)
+      }
+    }
+
+    if (buffer.trim()) {
+      processEventBlock(buffer)
     }
   } catch (error) {
     console.error('搜索失败:', error)
