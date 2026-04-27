@@ -83,7 +83,7 @@ func LoadConfig() *Config {
 
 		// MySQL 配置（可选，如果不配置则不启用数据库相关功能）
 		// 注意：必须包含 parseTime=true 参数，否则无法正确解析时间字段
-		//MySQLDSN: getEnv("MYSQL_DSN", "root:123456@tcp(127.0.0.1:3306)/ai_kb?charset=utf8mb4&parseTime=true&loc=Local"),
+		MySQLDSN: getEnv("MYSQL_DSN", "root:123456@tcp(127.0.0.1:3306)/ai_kb?charset=utf8mb4&parseTime=true&loc=Local"),
 		//MySQLDSN: getEnv("MYSQL_DSN", "personal-ai-kb:6mcETznRjwdmK7XN@tcp(127.0.0.1:3306)/ai_kb?charset=utf8mb4&parseTime=true&loc=Local"),
 
 		// 日志配置
